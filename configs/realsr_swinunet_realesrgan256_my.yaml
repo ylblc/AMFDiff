@@ -1,15 +1,15 @@
 trainer:
   target: trainer.TrainerDifIRLPIPS
-resume: ~
+
 autoencoder:
   target: ldm.models.autoencoder.VQModelTorch
   ckpt_path: weights/autoencoder_vq_f4.pth
   use_fp16: True
-  tune_decoder: ~
+  tune_decoder: False
   params:
+    lora_tune_decoder: False
     embed_dim: 3
     n_embed: 8192
-    lora_tune_decoder: ~
     ddconfig:
       double_z: False
       z_channels: 3
@@ -27,7 +27,7 @@ autoencoder:
       padding_mode: zeros
 
 model:
-  target: models.unet.UNetModelSwin
+  target: models.unet.UNetModelSwinPyConv
   #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
   ckpt_path: ~
   params:
@@ -55,6 +55,7 @@ model:
 diffusion:
   target: models.script_util.create_gaussian_diffusion
   params:
+#    放大倍率（生成）
     sf: 4
     schedule_name: exponential
     schedule_kwargs:
@@ -66,11 +67,13 @@ diffusion:
     weighted_mse: False
     predict_type: xstart
     timestep_respacing: ~
+#    latent tensor数值放缩比例
     scale_factor: 1.0
     normalize_input: True
     latent_flag: True
 
 degradation:
+#  图像超分放缩比例(退化)
   sf: 4
   # the first degradation process
   resize_prob: [0.2, 0.7, 0.1]  # up, down, keep
@@ -105,7 +108,7 @@ data:
 #                      '/mnt/sfs-common/zsyue/database/ImageNet/files_txt/path_train_all.txt',
 #                      '/mnt/sfs-common/zsyue/database/FFHQ/files_txt/files256.txt',
                      ] 
-      im_exts: ['JPEG','PNG','JPG','jpeg','png','jpg']
+      im_exts: ['JPEG', 'PNG','JPG','jpeg','png','jpg']
       io_backend:
         type: disk
       blur_kernel_size: 21
@@ -149,22 +152,26 @@ data:
 
 train:
   # learning rate
-  lr: 8e-6                      # learning rate
-  lr_min: 2e-7                      # learning rate
-  lr_schedule: cosin
-  warmup_iterations: 8000
+  lr: 6e-6                      # learning rate  5e-6 ≤ lr ≤ 2e-5
+  lr_min: 2e-7                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
+  lr_schedule: cosinRestarts 
+  warmup_iterations: 1000           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
+  cycle_iterations: 4000           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
+  t_mult: 1
   # dataloader
-  batch: [16, 4]
+#  [训练批次大小, 验证批次大小]
+  batch: [16,4]
+#  总批次大小 = 微批次大小 * GPU数量 * 梯度累积次数
   microbatch: 4
-  num_workers: 6
+  num_workers: 8
   prefetch_factor: 2            
   # optimization settings
-  weight_decay: 0               
+  weight_decay: 1e-4               
   ema_rate: 0.999
   iterations: 10            # total iterations
   # save logging
   save_freq: 2
-  log_freq: [2, 2, 2]         # [training loss, training images, val images]
+  log_freq: [2,500,500]         # [training loss, training images, val images]
   loss_coef: [1.0, 1.0]         # [mse, lpips]
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging
@@ -175,7 +182,7 @@ train:
   val_resolution: ${model.params.lq_size}
   val_padding_mode: reflect
   # training setting
-  use_amp: True                # amp training
+  use_amp: True               # amp training
   seed: 123456                 # random seed
   global_seeding: False
   # model compile

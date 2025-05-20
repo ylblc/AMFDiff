@@ -291,6 +291,7 @@ class TrainerBase:
         return data
 
     def validation(self):
+        pass
         return None,None
 
     def train(self):
@@ -303,31 +304,59 @@ class TrainerBase:
         self.resume_from_ckpt()  # resume if necessary
 
         self.build_dataloader()  # prepare data: self.dataloaders, self.datasets, self.sampler
-
+        # UNetModelSwin 训练模式
         self.model.train()
+        shanghai_tz=datetime.timezone(datetime.timedelta(hours=+8))
+        current_time = datetime.datetime.now(shanghai_tz).strftime('%Y-%m-%d %H:%M:%S')
+        self.logger.info(f'开始时间： {current_time}')
+        best_mean_psnr,best_mean_lpips=0,float('inf')
+        # patience = self.configs.train.early_stop_num  # 允许连续patience轮验证指标未改善
+        patience = 8
+        wait = 0
+
+
         num_iters_epoch = math.ceil(len(self.datasets['train']) / self.configs.train.batch[0])
         for ii in range(self.iters_start, self.configs.train.iterations):
             self.current_iters = ii + 1
 
-            # prepare data
+            # prepare data,self.dataloaders 包含 self.dataloaders.train and self.dataloaders.val
             data = self.prepare_data(next(self.dataloaders['train']))
 
             # training phase
             self.training_step(data)
 
+            mean_psnr,mean_lpips=None,None
             # validation phase
             if 'val' in self.dataloaders and (ii+1) % self.configs.train.get('val_freq', 10000) == 0:
-                (psnr,lpips)=self.validation()
+                mean_psnr,mean_lpips=self.validation()
 
             #update learning rate
             self.adjust_lr()
 
             # save checkpoint
             if (ii+1) % self.configs.train.save_freq == 0:
-                self.save_ckpt()
+                if mean_psnr is not None and mean_lpips is not None:
+                    # 两个指标同时变差
+                    if mean_psnr < best_mean_psnr and mean_lpips > best_mean_lpips:
+                        wait += 1
+                        self.logger.error(f"Metric decrease warning ({wait}/{patience})  at epoch [{ii+1}]，case: psnr={mean_psnr:5.2f}, lpips={mean_lpips:6.4f}")
+                        if wait >= patience:
+                            self.logger.error(f"Early stopping at epoch [{ii+1}]")
+                            break
+                        self.logger.info("="*100)
+                    else:
+                        if mean_psnr > best_mean_psnr:
+                            best_mean_psnr = mean_psnr
+                        if mean_lpips < best_mean_lpips:
+                            best_mean_lpips = mean_psnr
+                        wait = 0
+                        self.save_ckpt()
+                else:
+                    self.save_ckpt()
 
             if (ii+1) % num_iters_epoch == 0 and self.sampler is not None:
                 self.sampler.set_epoch(ii+1)
+
 
         # close the tensorboard
         self.close_logger()
@@ -443,6 +472,13 @@ class TrainerDifIR(TrainerBase):
                     T_max=self.configs.train.iterations - self.configs.train.warmup_iterations,
                     eta_min=self.configs.train.lr_min,
                     )
+        if self.configs.train.lr_schedule == 'cosinRestarts':
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer=self.optimizer,
+                T_0=self.configs.train.cycle_iterations,
+                T_mult=self.configs.train.t_mult,
+                eta_min=self.configs.train.lr_min,
+            )
 
     def build_model(self):
         super().build_model()
@@ -545,6 +581,7 @@ class TrainerDifIR(TrainerBase):
             self.queue_gt[self.queue_ptr:self.queue_ptr + b, :, :, :] = self.gt.clone()
             self.queue_ptr = self.queue_ptr + b
 
+    # 对图像进行高阶退化操作，源自文章 Denoising Diffusion Probabilistic Models for Robust Image Super-Resolution in the Wild
     @torch.no_grad()
     def prepare_data(self, data, dtype=torch.float32, realesrgan=None, phase='train'):
         if realesrgan is None:
@@ -571,9 +608,10 @@ class TrainerDifIR(TrainerBase):
                 im_gt = self.use_sharpener(im_gt)
 
             # ----------------------- The first degradation process ----------------------- #
+            #  包含操作：blur \  resize \  JPEG compression
             # blur
             out = filter2D(im_gt, kernel1)
-            # random resize
+            # random resize，随机选择resize方式
             updown_type = random.choices(
                     ['up', 'down', 'keep'],
                     self.configs.degradation['resize_prob'],
@@ -588,6 +626,7 @@ class TrainerDifIR(TrainerBase):
             out = F.interpolate(out, scale_factor=scale, mode=mode)
             # add noise
             gray_noise_prob = self.configs.degradation['gray_noise_prob']
+            # 随机使用灰度噪声
             if random.random() < self.configs.degradation['gaussian_noise_prob']:
                 out = random_add_gaussian_noise_pt(
                     out,
@@ -725,6 +764,7 @@ class TrainerDifIR(TrainerBase):
         else:
             return {key:value.cuda().to(dtype=dtype) for key, value in data.items()}
 
+    # 会议损失 （老版损失，无感知正则化）
     def backward_step(self, dif_loss_wrapper, micro_data, num_grad_accumulate, tt):
         context = torch.cuda.amp.autocast if self.configs.train.use_amp else nullcontext
         with context():
@@ -751,7 +791,7 @@ class TrainerDifIR(TrainerBase):
                     size=(micro_data['gt'].shape[0],),
                     device=f"cuda:{self.rank}",
                     )
-            latent_downsamping_sf = 2**(len(self.configs.autoencoder.params.ddconfig.ch_mult) - 1)
+            latent_downsamping_sf = 2**(len(self.configs.autoencoder.params.ddconfig.ch_mult) - 1) # self.configs.autoencoder.params.ddconfig.ch_mult=[1,2,4]
             latent_resolution = micro_data['gt'].shape[-1] // latent_downsamping_sf
             if 'autoencoder' in self.configs:
                 noise_chn = self.configs.autoencoder.params.embed_dim
@@ -766,7 +806,7 @@ class TrainerDifIR(TrainerBase):
                 if 'mask' in micro_data:
                     model_kwargs['mask'] = micro_data['mask']
             else:
-                model_kwargs = None
+                model_kwargs = None #compute_losses() = [terms, z_t, pred_zstart]
             compute_losses = functools.partial(
                 self.base_diffusion.training_losses,
                 self.model,
@@ -973,13 +1013,17 @@ class TrainerDifIR(TrainerBase):
             return mean_psnr, mean_lpips
         return None,None
 
+
 class TrainerDifIRLPIPS(TrainerDifIR):
+
+    # 期刊损失函数，新版
     def backward_step(self, dif_loss_wrapper, micro_data, num_grad_accumulate, tt):
-        loss_coef = self.configs.train.get('loss_coef')
-        context = torch.cuda.amp.autocast if self.configs.train.use_amp else nullcontext
+        loss_coef = self.configs.train.get('loss_coef') #  [mse, lpips]
+        context = torch.cuda .amp.autocast if self.configs.train.use_amp else nullcontext
         # diffusion loss
         with context():
             losses, z_t, z0_pred = dif_loss_wrapper()
+
             x0_pred = self.base_diffusion.decode_first_stage(
                     z0_pred,
                     self.autoencoder,
@@ -1013,8 +1057,8 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             loss.backward()
         else:
             self.amp_scaler.scale(loss).backward()
-
         return losses, z0_pred, z_t
+
 
     def log_step_train(self, loss, tt, batch, z_t, z0_pred, phase='train'):
         '''
