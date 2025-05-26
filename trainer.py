@@ -35,7 +35,6 @@ import torchvision.utils as vutils
 # from torch.utils.tensorboard import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-
 class TrainerBase:
     def __init__(self, configs):
         self.configs = configs
@@ -349,6 +348,9 @@ class TrainerBase:
                             best_mean_psnr = mean_psnr
                         if mean_lpips < best_mean_lpips:
                             best_mean_lpips = mean_psnr
+                        # 最好指标
+                        if mean_psnr >= best_mean_psnr and mean_lpips <= best_mean_lpips:
+                            self.save_ckpt("model_best.pth")
                         wait = 0
                         self.save_ckpt()
                 else:
@@ -368,9 +370,9 @@ class TrainerBase:
         assert hasattr(self, 'lr_scheduler')
         self.lr_scheduler.step()
 
-    def save_ckpt(self):
+    def save_ckpt(self,name=""):
         if self.rank == 0:
-            ckpt_path = self.ckpt_dir / 'model_{:d}.pth'.format(self.current_iters)
+            ckpt_path = self.ckpt_dir / 'model_{:d}.pth'.format(self.current_iters) if name == "" else self.ckpt_dir / name
             ckpt = {
                     'iters_start': self.current_iters,
                     'log_step': {phase:self.log_step[phase] for phase in ['train', 'val']},
@@ -381,7 +383,7 @@ class TrainerBase:
                 ckpt['amp_scaler'] = self.amp_scaler.state_dict()
             torch.save(ckpt, ckpt_path)
             if hasattr(self, 'ema_rate'):
-                ema_ckpt_path = self.ema_ckpt_dir / 'ema_model_{:d}.pth'.format(self.current_iters)
+                ema_ckpt_path = self.ema_ckpt_dir / 'ema_model_{:d}.pth'.format(self.current_iters)  if name == "" else self.ema_ckpt_dir / ('ema_'+name)
                 torch.save(self.ema_state, ema_ckpt_path)
 
     def reload_ema_model(self):
@@ -1156,4 +1158,3 @@ if __name__ == '__main__':
     xx = vutils.make_grid(torch.from_numpy(im_grid), nrow=5, normalize=True, scale_each=True).numpy()
     util_image.imshow(np.concatenate((im1, im2), 0))
     util_image.imshow(xx.transpose((1,2,0)))
-

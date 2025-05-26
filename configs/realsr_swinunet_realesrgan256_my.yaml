@@ -103,7 +103,7 @@ data:
   train:
     type: realesrgan
     params:
-      dir_paths: ['testdata/Bicubicx4/gt']
+      dir_paths: ['traindata/DIV256_train',"traindata/Flickr_256"]
       txt_file_path: [
 #                      '/mnt/sfs-common/zsyue/database/ImageNet/files_txt/path_train_all.txt',
 #                      '/mnt/sfs-common/zsyue/database/FFHQ/files_txt/files256.txt',
@@ -152,12 +152,13 @@ data:
 
 train:
   # learning rate
-  lr: 6e-6                      # learning rate  5e-6 ≤ lr ≤ 2e-5
-  lr_min: 2e-7                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
-  lr_schedule: cosinRestarts 
-  warmup_iterations: 1000           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
-  cycle_iterations: 4000           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
-  t_mult: 1
+  lr: 5e-5                      # learning rate  5e-6 ≤ lr ≤ 2e-5
+  lr_min: 1e-5                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
+  lr_schedule: cosinRestarts                # cosin or cosinRestarts
+#  lr_schedule: cosinRestarts
+  warmup_iterations: 2500           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
+  cycle_iterations: 3000           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
+  t_mult: 2
   # dataloader
 #  [训练批次大小, 验证批次大小]
   batch: [16,4]
@@ -171,7 +172,7 @@ train:
   iterations: 10            # total iterations
   # save logging
   save_freq: 2
-  log_freq: [2,500,500]         # [training loss, training images, val images]
+  log_freq: [2,2,4]         # [training loss, training images, val images]
   loss_coef: [1.0, 1.0]         # [mse, lpips]
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging

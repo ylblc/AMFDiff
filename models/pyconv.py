@@ -149,6 +149,24 @@ class PyConv3SEResDP(nn.Module):
         self.relu = nn.LeakyReLU(inplace=True)
         self.drop_prob = drop_path * ( layer_depth/max_depth)
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+    def forward(self, x):
+
+        out = self.pyconv(x)
+        out = self.relu(out)
+        out = out * self.se(out)
+        x = self.skip(x)
+        out = self.drop_path(out) + x
+        return out
+
+class PyConv3AdaptiveSEResDP(nn.Module):
+    def __init__(self, inplans, planes,layer_depth, max_depth,drop_path=0.1,*args):
+        super(PyConv3AdaptiveSEResDP, self).__init__()
+        self.pyconv = PyConv3(inplans, planes,*args)
+        self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
+        self.se = SELayer(planes)
+        self.relu = nn.LeakyReLU(inplace=True)
+        self.drop_prob = drop_path * ( layer_depth/max_depth)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         self.alpha=nn.Parameter(torch.ones(1))
         self.eps = 1e-6  # 数值安全阈值
     def forward(self, x):
@@ -166,7 +184,6 @@ class PyConv3SEResDP(nn.Module):
         x = self.skip(x)
         out = self.drop_path(out) + x
         return out
-
 # 通道注意力
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):
@@ -184,7 +201,18 @@ class SELayer(nn.Module):
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=3, padding=1)
 
+    def forward(self, x):
+        # 沿通道维度计算均值与最大值
+        avg_out = torch.mean(x, dim=1, keepdim=True)  # [B,1,H,W]
+        max_out, _ = torch.max(x, dim=1, keepdim=True)  # [B,1,H,W]
+        feat = torch.cat([avg_out, max_out], dim=1)  # [B,2,H,W]
+        attn = torch.sigmoid(self.conv(feat))  # [B,1,H,W]
+        return x * attn  # 特征加权
 class PyConv2(nn.Module):
 
     def __init__(self, inplans, planes,pyconv_kernels=[3, 5], stride=1, pyconv_groups=[1, 4]):
