@@ -100,7 +100,7 @@ data:
   train:
     type: realesrgan
     params:
-      dir_paths: ['testdata/Bicubicx4/gt']
+      dir_paths: ['traindata/DIV2K_train_HR','traindata/Flickr2K']
       txt_file_path: [
 #                      '/mnt/sfs-common/zsyue/database/ImageNet/files_txt/path_train_all.txt',
 #                      '/mnt/sfs-common/zsyue/database/FFHQ/files_txt/files256.txt',
@@ -149,14 +149,14 @@ data:
 
 train:
   # learning rate
-  lr: 8e-6                      # learning rate
-  lr_min: 2e-7                      # learning rate
+  lr: 5e-5                      # learning rate
+  lr_min: 2e-5                      # learning rate
   lr_schedule: cosin
-  warmup_iterations: 8000
+  warmup_iterations: 5000
   # dataloader
   batch: [16, 4]
   microbatch: 4
-  num_workers: 6
+  num_workers: 8
   prefetch_factor: 2            
   # optimization settings
   weight_decay: 0               
