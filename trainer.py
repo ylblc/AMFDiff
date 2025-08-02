@@ -829,6 +829,12 @@ class TrainerDifIR(TrainerBase):
             if last_batch:
                 self.log_step_train(losses, tt, micro_data, z_t, z0_pred.detach())
 
+        # # 在优化器step前添加
+        # torch.nn.utils.clip_grad_norm_(
+        #     self.model.parameters(),
+        #     max_norm=100.0,  # 将梯度范数限制在100以内
+        #     norm_type=2
+        # )
         if self.configs.train.use_amp:
             self.amp_scaler.step(self.optimizer)
             self.amp_scaler.update()

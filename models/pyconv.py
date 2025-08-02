@@ -165,24 +165,18 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
         self.se = SELayer(planes)
         self.relu = nn.LeakyReLU(inplace=True)
-        self.drop_prob = drop_path * ( layer_depth/max_depth)
-        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
-        self.alpha=nn.Parameter(torch.ones(1))
-        self.eps = 1e-6  # 数值安全阈值
+        self.layer_depth = layer_depth
+        self.max_depth = max_depth
+        min_drop_prob = 0.01  # 防止概率为0
+        self.drop_prob = max(min_drop_prob, drop_path * (1 - layer_depth / max_depth))
+        self.drop_path = DropPath(self.drop_prob) if self.drop_prob > 0 else nn.Identity()
     def forward(self, x):
-
+        identity = x
         out = self.pyconv(x)
+        out = out * self.se(out)
         out = self.relu(out)
-
-        # 数值安全处理
-        out_safe = torch.clamp(out, min=self.eps)
-        # 计算幂次项
-        alpha = torch.pow(out_safe, self.alpha)
-        # 增强控制
-        out = alpha * self.se(out)
-
-        x = self.skip(x)
-        out = self.drop_path(out) + x
+        identity = self.skip(identity)
+        out = self.drop_path(out) + identity
         return out
 # 通道注意力
 class SELayer(nn.Module):
