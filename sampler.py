@@ -351,7 +351,145 @@ class ResShiftSampler(BaseSampler):
             util_image.imwrite(im_sr, im_path, chn='bgr', dtype_in='uint8')
 
         self.write_log(f"Processing done, enjoy the results in {str(out_path)}")
+    def inference2(self, in_path, out_path, mask_path=None, mask_back=True, bs=1, noise_repeat=False):
+            '''
+            Inference demo.
+            Input:
+                in_path: str, folder or image path for LQ image
+                out_path: str, folder save the results
+                bs: int, default bs=1, bs % num_gpus == 0
+                mask_path: image mask for inpainting
+            '''
+            def _process_per_image(im_lq_tensor, mask=None):
+                '''
+                Input:
+                    im_lq_tensor: b x c x h x w, torch tensor, [-1, 1], RGB
+                    mask: image mask for inpainting, [-1, 1], 1 for unknown area
+                Output:
+                    im_sr: h x w x c, numpy array, [0,1], RGB
+                '''
 
+                context = torch.cuda.amp.autocast if self.use_amp else nullcontext
+                if im_lq_tensor.shape[2] > self.chop_size or im_lq_tensor.shape[3] > self.chop_size:
+                    if mask is not None:
+                        im_lq_tensor = torch.cat([im_lq_tensor, mask], dim=1)
+                    im_spliter = ImageSpliterTh(
+                            im_lq_tensor,
+                            self.chop_size,
+                            stride=self.chop_stride,
+                            sf=self.sf,
+                            extra_bs=self.chop_bs,
+                            )
+                    for im_lq_pch, index_infos in im_spliter:
+                        if mask is not None:
+                            im_lq_pch, mask_pch = im_lq_pch[:, :-1], im_lq_pch[:, -1:,]
+                        else:
+                            mask_pch = None
+                        with context():
+                            im_sr_pch = self.sample_func(
+                                    im_lq_pch,
+                                    noise_repeat=noise_repeat,
+                                    mask=mask_pch,
+                                    )     # 1 x c x h x w, [-1, 1]
+                        im_spliter.update(im_sr_pch, index_infos)
+                    im_sr_tensor = im_spliter.gather()
+                else:
+                    # print(im_lq_tensor.shape)
+                    with context():
+                        im_sr_tensor = self.sample_func(
+                                im_lq_tensor,
+                                noise_repeat=noise_repeat,
+                                mask=mask,
+                                )     # 1 x c x h x w, [-1, 1]
+
+                im_sr_tensor = im_sr_tensor * 0.5 + 0.5
+                if mask_back and mask is not None:
+                    mask = mask * 0.5 + 0.5
+                    im_lq_tensor = im_lq_tensor * 0.5 + 0.5
+                    im_sr_tensor = im_sr_tensor * mask + im_lq_tensor * (1 - mask)
+                return im_sr_tensor
+
+            in_path = Path(in_path) if not isinstance(in_path, Path) else in_path
+            out_path = Path(out_path) if not isinstance(out_path, Path) else out_path
+            im_sr_tensors=[]
+            im_srs=[]
+            if self.rank == 0:
+                assert in_path.exists()
+
+
+            if self.num_gpus > 1:
+                dist.barrier()
+
+            if in_path.is_dir():
+                if mask_path is None:
+                    data_config = {'type': 'base',
+                                   'params': {'dir_path': str(in_path),
+                                              'transform_type': 'default',
+                                              'transform_kwargs': {
+                                                  'mean': 0.5,
+                                                  'std': 0.5,
+                                                  },
+                                              'need_path': True,
+                                              'recursive': True,
+                                              'length': None,
+                                              }
+                                   }
+                else:
+                    data_config = {'type': 'inpainting_val',
+                                   'params': {'lq_path': str(in_path),
+                                              'mask_path': mask_path,
+                                              'transform_type': 'default',
+                                              'transform_kwargs': {
+                                                  'mean': 0.5,
+                                                  'std': 0.5,
+                                                  },
+                                              'need_path': True,
+                                              'recursive': True,
+                                              'im_exts': ['png', 'jpg', 'jpeg', 'JPEG', 'bmp', 'PNG'],
+                                              'length': None,
+                                              }
+                                   }
+                dataset = create_dataset(data_config)
+                self.write_log(f'Find {len(dataset)} images in {in_path}')
+                dataloader = torch.utils.data.DataLoader(
+                        dataset,
+                        batch_size=bs,
+                        shuffle=False,
+                        drop_last=False,
+                        )
+                for data in dataloader:
+                    micro_batchsize = math.ceil(bs / self.num_gpus)
+                    ind_start = self.rank * micro_batchsize
+                    ind_end = ind_start + micro_batchsize
+                    micro_data = {key:value[ind_start:ind_end] for key,value in data.items()}
+
+                    if micro_data['lq'].shape[0] > 0:
+                        results = _process_per_image(
+                                micro_data['lq'].cuda(),
+                                mask=micro_data['mask'].cuda() if 'mask' in micro_data else None,
+                                )    # b x h x w x c, [0, 1], RGB
+                        im_sr_tensors.append(results)
+                        for jj in range(results.shape[0]):
+                            im_sr = util_image.tensor2img(results[jj],  min_max=(0.0, 1.0))
+                            im_srs.append(im_sr)
+                if self.num_gpus > 1:
+                    dist.barrier()
+            else:
+                im_lq = util_image.imread(in_path, chn='rgb', dtype='float32')  # h x w x c
+                im_lq_tensor = util_image.img2tensor(im_lq).cuda()              # 1 x c x h x w
+                if mask_path is not None:
+                    im_mask = util_image.imread(mask_path, chn='gray', dtype='float32')[:,:, None]  # h x w x 1
+                    im_mask_tensor = util_image.img2tensor(im_mask).cuda()              # 1 x c x h x w
+
+                im_sr_tensor = _process_per_image(
+                        (im_lq_tensor - 0.5) / 0.5,
+                        mask=(im_mask_tensor - 0.5) / 0.5 if mask_path is not None else None,
+                        )
+
+                im_sr = util_image.tensor2img(im_sr_tensor, min_max=(0.0, 1.0))
+                im_srs.append(im_sr)
+                im_sr_tensors.append(im_sr_tensor)
+            return im_sr_tensors,im_srs
 if __name__ == '__main__':
     pass
 

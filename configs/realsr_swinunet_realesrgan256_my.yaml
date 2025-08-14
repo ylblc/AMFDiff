@@ -103,12 +103,12 @@ data:
   train:
     type: realesrgan
     params:
-      dir_paths: ['traindata/DIV256_train',"traindata/Flickr_256"]
+      dir_paths: ['traindata/DIV2K_train_HR',"traindata/Flickr2K"]
       txt_file_path: [
 #                      '/mnt/sfs-common/zsyue/database/ImageNet/files_txt/path_train_all.txt',
 #                      '/mnt/sfs-common/zsyue/database/FFHQ/files_txt/files256.txt',
                      ] 
-      im_exts: ['JPEG', 'PNG','JPG','jpeg','png','jpg']
+      im_exts: ['jpeg','png','jpg']
       io_backend:
         type: disk
       blur_kernel_size: 21
@@ -153,10 +153,10 @@ data:
 train:
   # learning rate
   lr: 5e-5                      # learning rate  5e-6 ≤ lr ≤ 2e-5
-  lr_min: 1e-5                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
-  lr_schedule: cosinRestarts                # cosin or cosinRestarts
+  lr_min: 2e-5                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
+  lr_schedule: cosin                # cosin or cosinRestarts
 #  lr_schedule: cosinRestarts
-  warmup_iterations: 2500           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
+  warmup_iterations: 5000           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
   cycle_iterations: 3000           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
   t_mult: 2
   # dataloader

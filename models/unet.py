@@ -1180,8 +1180,7 @@ class UNetModelConv(nn.Module):
         out = self.out(h)
         return out
 
-from models.pyconv import  PyConv3SERes, PyConv3SEResDP, PyConv3AdaptiveSEResDP
-
+from models.pyconv import   PyConv3AdaptiveSEResDP, PyConv3AdaptiveSEResDP2
 
 class UNetModelSwinPyConv(nn.Module):
     """

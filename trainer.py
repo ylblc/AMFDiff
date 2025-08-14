@@ -344,13 +344,11 @@ class TrainerBase:
                             break
                         self.logger.info("="*100)
                     else:
-                        if mean_psnr > best_mean_psnr:
-                            best_mean_psnr = mean_psnr
-                        if mean_lpips < best_mean_lpips:
-                            best_mean_lpips = mean_psnr
                         # 最好指标
                         if mean_psnr >= best_mean_psnr and mean_lpips <= best_mean_lpips:
-                            self.save_ckpt("model_best.pth")
+                            best_mean_psnr = mean_psnr
+                            best_mean_lpips = mean_psnr
+                            self.save_ckpt(f"model_best_{self.current_iters}.pth")
                         wait = 0
                         self.save_ckpt()
                 else:
@@ -1060,12 +1058,54 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                 losses["loss"] = losses["mse"]
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
+            # 轻微提升
+            ssim_loss = self.ssim_loss(x0_pred, micro_data['gt'])
+
+            flag_nan = torch.any(torch.isnan(ssim_loss))
+            if flag_nan:
+                ssim_loss = torch.nan_to_num(ssim_loss, nan=0.0)
+            losses['loss'] +=  0.5 * ssim_loss
             loss = losses['loss'].mean() / num_grad_accumulate
         if self.amp_scaler is None:
             loss.backward()
         else:
             self.amp_scaler.scale(loss).backward()
+        # 检查梯度
         return losses, z0_pred, z_t
+
+
+    def ssim_loss(self,pred, target, window_size=7, C1=0.01 ** 2, C2=0.03 ** 2):
+        """
+        超安全SSIM实现，使用平均池化替代卷积
+        """
+        # 确保输入安全
+        pred = torch.clamp(pred, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+
+        # 使用平均池化计算局部统计量
+        avg_pool = lambda x: F.avg_pool2d(x, window_size, stride=1, padding=window_size // 2)
+
+        mu_pred = avg_pool(pred)
+        mu_target = avg_pool(target)
+
+        mu_pred_sq = mu_pred * mu_pred
+        mu_target_sq = mu_target * mu_target
+        mu_pred_target = mu_pred * mu_target
+
+        sigma_pred_sq = avg_pool(pred * pred) - mu_pred_sq
+        sigma_target_sq = avg_pool(target * target) - mu_target_sq
+        sigma_pred_target = avg_pool(pred * target) - mu_pred_target
+
+        # 确保方差非负
+        sigma_pred_sq = torch.relu(sigma_pred_sq) + 1e-6
+        sigma_target_sq = torch.relu(sigma_target_sq) + 1e-6
+
+        # 计算SSIM
+        numerator = (2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)
+        denominator = (mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2)
+
+        ssim_map = numerator / (denominator + 1e-8)
+        return 1 - ssim_map.mean(dim=(1, 2, 3))
 
 
     def log_step_train(self, loss, tt, batch, z_t, z0_pred, phase='train'):

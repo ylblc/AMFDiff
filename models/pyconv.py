@@ -2,6 +2,7 @@
     Duta et al. "Pyramidal Convolution: Rethinking Convolutional Neural Networks for Visual Recognition"
     https://arxiv.org/pdf/2006.11538.pdf
 """
+import numpy as np
 import torch
 import torch.nn as nn
 import os
@@ -140,26 +141,8 @@ class PyConv3SERes(nn.Module):
         x = self.skip(x)
         return out + x  # 残差相加
 
-class PyConv3SEResDP(nn.Module):
-    def __init__(self, inplans, planes,layer_depth, max_depth,drop_path=0.1,*args):
-        super(PyConv3SEResDP, self).__init__()
-        self.pyconv = PyConv3(inplans, planes,*args)
-        self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
-        self.se = SELayer(planes)
-        self.relu = nn.LeakyReLU(inplace=True)
-        self.drop_prob = drop_path * ( layer_depth/max_depth)
-        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
-    def forward(self, x):
-
-        out = self.pyconv(x)
-        out = self.relu(out)
-        out = out * self.se(out)
-        x = self.skip(x)
-        out = self.drop_path(out) + x
-        return out
-
 class PyConv3AdaptiveSEResDP(nn.Module):
-    def __init__(self, inplans, planes,layer_depth, max_depth,drop_path=0.1,*args):
+    def __init__(self, inplans, planes,layer_depth =None, max_depth=None,drop_prob=0.1,*args):
         super(PyConv3AdaptiveSEResDP, self).__init__()
         self.pyconv = PyConv3(inplans, planes,*args)
         self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
@@ -167,17 +150,79 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         self.relu = nn.LeakyReLU(inplace=True)
         self.layer_depth = layer_depth
         self.max_depth = max_depth
-        min_drop_prob = 0.01  # 防止概率为0
-        self.drop_prob = max(min_drop_prob, drop_path * (1 - layer_depth / max_depth))
+        self.drop_prob = drop_prob
         self.drop_path = DropPath(self.drop_prob) if self.drop_prob > 0 else nn.Identity()
+        self.alpha=nn.Parameter(torch.ones(1))
+        self.eps = 1e-6  # 数值安全阈值
     def forward(self, x):
         identity = x
         out = self.pyconv(x)
-        out = out * self.se(out)
         out = self.relu(out)
+
+        # 第一种：
+        # # 数值安全处理
+        # out_safe = torch.clamp(out, min=self.eps)
+        # # 计算幂次项
+        # alpha = torch.pow(out_safe, self.alpha)
+        # 增强控制
+        # out = alpha * self.se(out)
+
+        # 第二种：
+        out = self.alpha * self.se(out)
+
         identity = self.skip(identity)
         out = self.drop_path(out) + identity
         return out
+# 对drop_path的尝试
+class PyConv3AdaptiveSEResDP2(nn.Module):
+    def __init__(self, inplans, planes,layer_depth =None, max_depth=None,drop_prob=0.1,*args):
+        super(PyConv3AdaptiveSEResDP2, self).__init__()
+        self.pyconv = PyConv3(inplans, planes,*args)
+        self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
+        self.se = SELayer(planes)
+        self.relu = nn.LeakyReLU(inplace=True)
+        self.layer_depth = layer_depth
+        self.max_depth = max_depth
+        self.drop_prob = drop_prob
+        if self.layer_depth is not None and max_depth is not None and drop_prob != 0.0 :
+            if max_depth > 1:
+                min_drop_prob = 0.01  # 防止概率为0
+                # 深度特定配置
+                if max_depth == 2:
+                    k = 9
+                    cap = 0.25
+                elif max_depth == 3:
+                    k = 7
+                    cap = 0.3
+                else:  # max_depth == 4
+                    k = 5
+                    cap = 0.3
+                # 针对浅层网络的专用公式
+                depth_ratio = layer_depth / max_depth
+                # 核心改进：使用S形曲线代替幂函数
+                # k曲线陡峭度参数
+                s_curve = 1 / (1 + np.exp(-k * (depth_ratio - 0.5)))  # S形曲线
+                # 基础概率计算
+                base_prob = self.drop_prob * s_curve
+                # 应用约束条件
+                computed_drop_prob = max(min_drop_prob, min(base_prob, cap))
+                self.drop_path = DropPath(computed_drop_prob)
+            else:
+                self.drop_path = nn.Identity()
+        else:
+            self.drop_path = nn.Identity()
+
+        self.alpha=nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        identity = x
+        out = self.pyconv(x)
+        out = self.relu(out)
+        # 增强控制
+        out = self.alpha * self.se(out)
+
+        identity = self.skip(identity)
+        return self.drop_path(out) + identity
 # 通道注意力
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):
@@ -187,7 +232,7 @@ class SELayer(nn.Module):
             nn.Linear(channel, channel // reduction),
             nn.ReLU(inplace=True),
             nn.Linear(channel // reduction, channel),
-            nn.Sigmoid()
+            nn.Hardsigmoid()
         )
 
     def forward(self, x):
@@ -195,18 +240,88 @@ class SELayer(nn.Module):
         y = self.avg_pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
-class SpatialAttention(nn.Module):
-    def __init__(self):
+class EnhancedSEAttention(nn.Module):
+    """增强型通道注意力"""
+
+    def __init__(self, channels, reduction=8, k_size=3):
         super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=3, padding=1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        # 动态通道交互
+        self.dynamic_fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+
+        # 局部上下文增强
+        self.local_ctx = nn.Conv2d(channels, channels, k_size,
+                                   padding=k_size // 2, groups=channels)
+
+        self.scale = nn.Parameter(torch.tensor([0.2]))  # 可学习缩放因子
 
     def forward(self, x):
-        # 沿通道维度计算均值与最大值
-        avg_out = torch.mean(x, dim=1, keepdim=True)  # [B,1,H,W]
-        max_out, _ = torch.max(x, dim=1, keepdim=True)  # [B,1,H,W]
-        feat = torch.cat([avg_out, max_out], dim=1)  # [B,2,H,W]
-        attn = torch.sigmoid(self.conv(feat))  # [B,1,H,W]
-        return x * attn  # 特征加权
+        b, c, _, _ = x.size()
+
+        # 全局通道注意力
+        avg_out = self.dynamic_fc(self.avg_pool(x).view(b, c))
+        max_out = self.dynamic_fc(self.max_pool(x).view(b, c))
+        global_attn = (avg_out + max_out).view(b, c, 1, 1)
+
+        # 局部上下文调制
+        local_ctx = torch.sigmoid(self.local_ctx(x))
+
+        # 组合并缩放
+        return x * (1 + self.scale * global_attn * local_ctx)
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        avg_out = self.fc(self.avg_pool(x).view(b, c))
+        max_out = self.fc(self.max_pool(x).view(b, c))
+        out = avg_out + max_out
+        return x * out.view(b, c, 1, 1)
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.sigmoid(self.conv(out))
+        return x * out
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module"""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.ca = ChannelAttention(channels)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
 class PyConv2(nn.Module):
 
     def __init__(self, inplans, planes,pyconv_kernels=[3, 5], stride=1, pyconv_groups=[1, 4]):
