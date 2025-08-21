@@ -27,7 +27,7 @@ autoencoder:
       padding_mode: zeros
 
 model:
-  target: models.unet.UNetModelSwinPyConv
+  target: models.unet.UNetModelSwinPyConv2
   #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
   ckpt_path: ~
   params:

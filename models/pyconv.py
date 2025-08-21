@@ -152,7 +152,7 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         self.max_depth = max_depth
         self.drop_prob = drop_prob
         self.drop_path = DropPath(self.drop_prob) if self.drop_prob > 0 else nn.Identity()
-        self.alpha=nn.Parameter(torch.ones(1))
+        self.alpha = nn.Parameter(torch.tensor(0.5))
         self.eps = 1e-6  # 数值安全阈值
     def forward(self, x):
         identity = x
@@ -230,7 +230,7 @@ class SELayer(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(channel // reduction, channel),
             nn.Hardsigmoid()
         )

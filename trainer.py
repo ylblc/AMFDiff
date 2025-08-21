@@ -1059,7 +1059,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
             # 轻微提升
-            ssim_loss = self.ssim_loss(x0_pred, micro_data['gt'])
+            ssim_loss = self.multi_scale_ssim_loss(x0_pred, micro_data['gt'])
 
             flag_nan = torch.any(torch.isnan(ssim_loss))
             if flag_nan:
@@ -1074,6 +1074,21 @@ class TrainerDifIRLPIPS(TrainerDifIR):
         return losses, z0_pred, z_t
 
 
+
+    def multi_scale_ssim_loss(self, pred, target):
+        weights = (0.5, 0.3, 0.2)
+        scales = len(weights)
+        loss = 0
+        for i, weight in enumerate(weights):
+            scale_factor = 1 / (2 ** i)
+
+            # 下采样
+            pred_scaled = F.interpolate(pred, scale_factor=scale_factor, mode='bilinear')
+            target_scaled = F.interpolate(target, scale_factor=scale_factor, mode='bilinear')
+
+            # 计算SSIM损失
+            loss += weight * self.ssim_loss(pred_scaled, target_scaled)
+        return loss
     def ssim_loss(self,pred, target, window_size=7, C1=0.01 ** 2, C2=0.03 ** 2):
         """
         超安全SSIM实现，使用平均池化替代卷积
