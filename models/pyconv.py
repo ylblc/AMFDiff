@@ -160,15 +160,15 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         out = self.relu(out)
 
         # 第一种：
-        # # 数值安全处理
-        # out_safe = torch.clamp(out, min=self.eps)
-        # # 计算幂次项
-        # alpha = torch.pow(out_safe, self.alpha)
+        # 数值安全处理
+        out_safe = torch.clamp(out, min=self.eps)
+        # 计算幂次项
+        alpha = torch.pow(out_safe, self.alpha)
         # 增强控制
-        # out = alpha * self.se(out)
+        out = alpha * self.se(out)
 
         # 第二种：
-        out = self.alpha * self.se(out)
+        # out = self.alpha * self.se(out)
 
         identity = self.skip(identity)
         out = self.drop_path(out) + identity

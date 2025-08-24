@@ -14,6 +14,7 @@ from einops import rearrange
 from contextlib import nullcontext
 
 from datapipe.datasets import create_dataset
+from ldm.modules.diffusionmodules.util import mean_flat
 
 from utils import util_net
 from utils import util_common
@@ -1058,13 +1059,16 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                 losses["loss"] = losses["mse"]
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
-            # 轻微提升
-            ssim_loss = self.multi_scale_ssim_loss(x0_pred, micro_data['gt'])
+            # # ssim 损失函数 轻微提升
+            # ssim_loss = self.multi_scale_ssim_loss(x0_pred, micro_data['gt'])
 
-            flag_nan = torch.any(torch.isnan(ssim_loss))
-            if flag_nan:
-                ssim_loss = torch.nan_to_num(ssim_loss, nan=0.0)
-            losses['loss'] +=  0.5 * ssim_loss
+            # skip_loss = torch.zeros_like(losses["loss"])
+            # computed_indexs = [i for i in range( 3*len(self.configs.model.params.channel_mult))][::3]
+            # for i, (res_h,multi_h,skip_h,final_h) in enumerate(self.model.get_skip_features()):
+            #     if i in computed_indexs:
+            #         skip_loss += self.variance_based_loss(res_h,skip_h)
+            # losses['loss'] += skip_loss
+            # losses['loss'] +=  0.5 * ssim_loss
             loss = losses['loss'].mean() / num_grad_accumulate
         if self.amp_scaler is None:
             loss.backward()
@@ -1074,6 +1078,26 @@ class TrainerDifIRLPIPS(TrainerDifIR):
         return losses, z0_pred, z_t
 
 
+    # 添加一致性约束损失
+    def feature_consistency_loss(self,resH, res_skip, final_feature):
+        # 确保融合特征保留原始特征信息
+        loss_resH = F.mse_loss(final_feature, resH.detach())
+        loss_res_skip = F.mse_loss(final_feature, res_skip.detach())
+        return 0.5 * (loss_resH + loss_res_skip)
+
+    # 添加特征相似性损失，但不强制一致性
+    def feature_similarity_loss(self,resH, res_skip, final_feature, alpha=0.01):
+        """
+        鼓励但不强制特征相似性的损失
+        alpha: 控制损失强度，非常小的值
+        """
+        # 计算余弦相似性
+        cos_sim = F.cosine_similarity(resH.detach().flatten(1), final_feature.flatten(1),dim=-1)
+
+        # 只有当特征差异很大时才施加轻微惩罚
+        penalty = torch.relu(0.5 - cos_sim).mean(dim=-1)
+
+        return alpha * penalty
 
     def multi_scale_ssim_loss(self, pred, target):
         weights = (0.5, 0.3, 0.2)
@@ -1088,6 +1112,9 @@ class TrainerDifIRLPIPS(TrainerDifIR):
 
             # 计算SSIM损失
             loss += weight * self.ssim_loss(pred_scaled, target_scaled)
+        flag_nan = torch.any(torch.isnan(loss))
+        if flag_nan:
+            loss = torch.nan_to_num(loss, nan=0.0)
         return loss
     def ssim_loss(self,pred, target, window_size=7, C1=0.01 ** 2, C2=0.03 ** 2):
         """

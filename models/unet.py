@@ -1806,7 +1806,7 @@ class UNetModelSwinPyConv2(nn.Module):
                 )
                 ch = int(model_channels * mult)
 
-
+        self.skip_features = []
     def forward(self, x, timesteps, lq=None, mask=None):
         """
         Apply the model to an input batch.
@@ -1818,6 +1818,7 @@ class UNetModelSwinPyConv2(nn.Module):
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels)).type(self.dtype)
 
+        self.skip_features=[]
         if lq is not None:
             assert self.cond_lq
             if mask is not None:
@@ -1845,16 +1846,22 @@ class UNetModelSwinPyConv2(nn.Module):
             afpf_inputs = [h[-1] for h in hs ]
             for jj,module in enumerate(module_list):
                 curr_hs_j = len(hs_row) - jj - 1
-                resH = hs_row[curr_hs_j]
-                resH_skip = self.skip_connections[ii][jj](resH)
-                fused_skip = self.afpfs[ii][jj](afpf_inputs, resH)
-                resH = self.ag_fusions[ii][jj](resH_skip, fused_skip)
-                h = th.cat([h, resH], dim=1)
+                res_h = hs_row[curr_hs_j]
+                # 多尺度特征融合
+                multi_h = self.afpfs[ii][jj](afpf_inputs, res_h)
+                # skip跳越层
+                skip_h = self.skip_connections[ii][jj](multi_h)
+                # 融合层
+                fusion_h = self.ag_fusions[ii][jj](skip_h, multi_h)
+                self.skip_features.append((res_h,multi_h,skip_h,fusion_h))
+                h = th.cat([h, fusion_h], dim=1)
                 h = module(h, emb)
         h = h.type(x.dtype)
         out = self.out(h)
         return out
 
+    def get_skip_features(self):
+        return self.skip_features
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.
@@ -1961,41 +1968,6 @@ class AFPF(nn.Module):
         return self.enhance(fused) + fused + base_feature
 
 
-class TimeAwareAFPF(AFPF):
-    def __init__(self, in_channels_list, out_channels, time_dim):
-        super().__init__(in_channels_list, out_channels)
-
-        # 时间步影响权重
-        self.time_weight = nn.Sequential(
-            nn.Linear(time_dim, 128),
-            nn.SiLU(),
-            nn.Linear(128, len(in_channels_list)))
-
-    def forward(self, features, base_feature, t_emb):
-        # 标准AFPF融合
-        fused = super().forward(features, base_feature)
-
-        # 时间步调整融合强度
-        time_weights = self.time_weight(t_emb)  # [B, num_levels]
-        time_weights = F.softmax(time_weights, dim=-1)
-
-        # 时间加权融合
-        weighted_fused = th.zeros_like(fused)
-        for i, feat in enumerate(features):
-            # 对齐特征
-            aligned = F.interpolate(
-                feat,
-                size=base_feature.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
-            # 应用时间权重
-            weight = time_weights[:, i].view(-1, 1, 1, 1)
-            weighted_fused += weight * self.align_convs[i](aligned)
-
-        # 时间控制融合比例
-        t_factor = th.sigmoid(t_emb.mean(dim=1, keepdim=True))
-        return (1 - t_factor) * fused + t_factor * weighted_fused
 
 
 class MultiScaleAttentionAFPF(AFPF):
