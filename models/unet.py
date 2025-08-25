@@ -1721,6 +1721,7 @@ class UNetModelSwinPyConv2(nn.Module):
         input_block_chans2 = deepcopy(input_block_chans)
         for level, mult in list(enumerate(channel_mult))[::-1]:
             # mult = [4,2,2,1]
+            self.skip_connections.append(nn.ModuleList([]))
             index = len(channel_mult) - level - 1
             for i in range(num_res_blocks[level] + 1):
                 ich = input_block_chans[level].pop()  # 编码器层的输出通道数
@@ -1736,7 +1737,9 @@ class UNetModelSwinPyConv2(nn.Module):
                         use_scale_shift_norm=use_scale_shift_norm,
                         )
                 ]
-
+                self.skip_connections[index].append(
+                    PyConv3AdaptiveSEResDP(ich, ich, level + 1, len(channel_mult))
+                )
                 ch = int(model_channels * mult)
 
                 if ds in attention_resolutions and i==0:
@@ -1786,23 +1789,31 @@ class UNetModelSwinPyConv2(nn.Module):
             nn.SiLU(),
             conv_nd(dims, input_ch, out_channels, 3, padding=1),
         )
-
         layer_chs =  [int(model_channels * mult) for mult in channel_mult]
+        self.aligns = nn.ModuleList([])
+        self.layer_selects = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
-            self.skip_connections.append(nn.ModuleList([]))
             self.afpfs.append(nn.ModuleList([]))
             self.ag_fusions.append(nn.ModuleList([]))
             index = len(channel_mult) - level - 1
+            self.aligns.append(nn.ModuleList([]))
+            layer_length = len(channel_mult)
+            self.layer_selects.append(
+                AdaptiveFeatureSelect(layer_length,layer_length,min=max(1,layer_length-2))
+            )
             for i in range(num_res_blocks[level] + 1):
                 ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
-                self.skip_connections[index].append(
-                    PyConv3AdaptiveSEResDP(ich, ich, level + 1, len(channel_mult))
-                )
                 self.afpfs[index].append(
-                    AFPF(layer_chs, ich)
+                    # AFPF2(layer_chs, ich)
+                    SCAttentionAFPF(layer_chs,ich)
                 )
                 self.ag_fusions[index].append(
-                    AdaptiveGateFusion(ich)
+                    # AdaptiveGateFusion(ich)
+                    LightGateFusion(ich)
+                    # AttentionGuidedFusion(ich)
+                )
+                self.aligns[index].append(
+                    FeatureAlign(layer_chs,ich)
                 )
                 ch = int(model_channels * mult)
 
@@ -1843,18 +1854,21 @@ class UNetModelSwinPyConv2(nn.Module):
         for ii,module_list in enumerate(self.output_blocks):
             curr_hs_i = output_blocks_len - ii - 1
             hs_row = hs[curr_hs_i]
-            afpf_inputs = [h[-1] for h in hs ]
+            afpf_features = self.layer_selects[curr_hs_i](hs,ii)
             for jj,module in enumerate(module_list):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
-                # 多尺度特征融合
-                multi_h = self.afpfs[ii][jj](afpf_inputs, res_h)
-                # skip跳越层
+                target_size = res_h.shape[2:]
+                afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
+                # # 多尺度特征融合
+                multi_h = self.afpfs[ii][jj](afpf_aligned_features, res_h)
+                # # skip跳越层
                 skip_h = self.skip_connections[ii][jj](multi_h)
-                # 融合层
-                fusion_h = self.ag_fusions[ii][jj](skip_h, multi_h)
-                self.skip_features.append((res_h,multi_h,skip_h,fusion_h))
-                h = th.cat([h, fusion_h], dim=1)
+                # # 融合层
+                res_h = skip_h
+                # res_h = self.ag_fusions[ii][jj](multi_h, skip_h)
+                # self.skip_features.append((res_h,multi_h,skip_h,fusion_h))
+                h = th.cat([h, res_h], dim=1)
                 h = module(h, emb)
         h = h.type(x.dtype)
         out = self.out(h)
@@ -1898,9 +1912,182 @@ class AdaptiveGateFusion(nn.Module):
         final_feat = skip_feat + self.residual_scale * combined_resH
         return final_feat
 
+
+class AttentionGuidedFusion(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.channels = channels
+
+        # 通道注意力
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(2 * channels, channels // reduction, 1),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, 2 * channels, 1),
+            nn.Sigmoid()
+        )
+
+        # 空间注意力
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3),
+            nn.Sigmoid()
+        )
+
+        # 自适应融合权重
+        self.fusion_weight = nn.Parameter(th.tensor(0.5))
+
+        # 残差缩放因子
+        self.residual_scale = nn.Parameter(th.tensor(1.0))
+
+    def forward(self, skip_feat, fused_feat):
+        # 通道注意力
+        combined = th.cat([skip_feat, fused_feat], dim=1)
+        channel_weights = self.channel_attention(combined)
+        channel_skip, channel_fused = channel_weights.chunk(2, dim=1)
+
+        # 空间注意力
+        avg_out = th.mean(combined, dim=1, keepdim=True)
+        max_out, _ = th.max(combined, dim=1, keepdim=True)
+        spatial_weights = self.spatial_attention(th.cat([avg_out, max_out], dim=1))
+
+        # 应用注意力
+        attended_skip = skip_feat * channel_skip * spatial_weights
+        attended_fused = fused_feat * channel_fused * spatial_weights
+
+        # 自适应融合
+        fusion_weight = th.sigmoid(self.fusion_weight)
+        combined_resH = fusion_weight * attended_skip + (1 - fusion_weight) * attended_fused
+
+        # 残差连接
+        final_feat = skip_feat + self.residual_scale * combined_resH
+
+        return final_feat
+
+class AdaptiveFeatureSelect(nn.Module):
+    """
+    自适应选择需要融合的特征
+
+    Args:
+    - num_encoder_layers: encoder层数
+    - num_decoder_layers: decoder层数
+    - min: 需要的特征层数
+    """
+    def __init__(self, num_encoder_layers, num_decoder_layers=None, min = None):
+        super().__init__()
+        self.num_encoder_layers = num_encoder_layers
+        self.num_decoder_layers = num_decoder_layers if num_decoder_layers is not None else num_encoder_layers
+        self.min = min if min is not None else num_encoder_layers
+        # 学习每个decoder层级应该关注哪些encoder层级
+        self.attention_weights = nn.Parameter(
+            th.ones(num_decoder_layers, num_encoder_layers)
+        )
+
+    def forward(self, hs, decoder_level):
+        """
+        Args:
+            hs (list): 保存的跳跃连接tensor list [skip_tensor1, skip_tensor2, ...]
+            decoder_level (int): 当前所在的decoder层数
+        """
+        # 获取当前decoder层级的注意力权重
+        weights = F.softmax(self.attention_weights[decoder_level], dim=0)
+
+        # 选择权重最高的几个特征
+        topk_weights, topk_indices = th.topk(weights, k=min(self.min, self.num_encoder_layers))
+
+        # 组合选中的特征
+        selected_features = []
+        for idx in topk_indices:
+            selected_features.append((hs[idx][-1],idx.item()))
+
+        return selected_features
+class FeatureAlign(nn.Module):
+    """
+    Args:
+        channels_list (list): encoder每层的通道数list [64，128, ...]
+        target_channels (int): 需要对齐的通道数
+    """
+    def __init__(self, channels_list, target_channels=256):
+        super().__init__()
+        self.target_channels = target_channels
+
+        # 为每个可能的encoder层创建对齐模块
+        self.aligners = nn.ModuleDict()
+        for i, channels in enumerate(channels_list):
+            # 通道对齐
+            channel_aligner = nn.Conv2d(channels, target_channels, 1)
+
+            # 注册对齐模块
+            self.aligners[f'layer_{i}'] = channel_aligner
+
+    def forward(self, features, target_size):
+        """
+        对齐特征到目标尺寸和通道数
+
+        参数:
+        - features (tensor list): 选择的encoder特征列表
+        - target_size (h,w): 目标空间尺寸 (H, W)
+        """
+        aligned_features = []
+
+        for feat,idx in features:
+
+            channel_aligned = self.aligners[f'layer_{idx}'](feat)
+            if channel_aligned.shape[2:] != target_size:
+                # 第一种
+                # channel_aligned = F.interpolate(
+                #     channel_aligned,
+                #     size=target_size,
+                #     mode='bilinear',
+                #     align_corners=False
+                # )
+
+                # 第二种
+                if channel_aligned.size(2) > target_size[0]:  # 需要下采样
+                    channel_aligned = F.adaptive_avg_pool2d(channel_aligned, target_size)
+                else:  # 需要上采样
+                    channel_aligned = F.interpolate(
+                        channel_aligned, size=target_size, mode='bilinear', align_corners=False
+                    )
+            aligned_features.append(channel_aligned)
+        return aligned_features
+
+class LightGateFusion(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.channels = channels
+
+        # 极简门控网络
+        self.gate_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(2 * channels, channels // reduction, 1),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, 2, 1),
+            nn.Sigmoid()
+        )
+
+        # 残差缩放因子
+        self.residual_scale = nn.Parameter(th.tensor(1.0))
+
+    def forward(self, skip_feat, fused_feat):
+        # 计算门控权重
+        combined = th.cat([skip_feat, fused_feat], dim=1)
+        gate_weights = self.gate_net(combined)
+        gate_skip, gate_fused = gate_weights.chunk(2, dim=1)
+
+        # 应用门控
+        gate_skip = gate_skip.view(-1, 1, 1, 1)
+        gate_fused = gate_fused.view(-1, 1, 1, 1)
+
+        combined_resH = skip_feat * gate_skip + fused_feat * gate_fused
+
+        # 残差连接
+        final_feat = skip_feat + self.residual_scale * combined_resH
+
+        return final_feat
 class AFPF(nn.Module):
     def __init__(self, in_channels_list, out_channels=256,enh_reduction=4,w_reduction=8):
         """
+        包含特征对齐的AFPF
         Args:
             in_channels_list (list): 输入特征的通道数列表 [ch1, ch2, ...]
             out_channels (int): 融合后输出通道数，默认256
@@ -1966,8 +2153,102 @@ class AFPF(nn.Module):
 
         # 4. 特征增强 (残差连接)
         return self.enhance(fused) + fused + base_feature
+class AFPF2(nn.Module):
+    def __init__(self, in_channels_list, out_channels=256,enh_reduction=4,w_reduction=8):
+        """
+        Args:
+            in_channels_list (list): 输入特征的通道数列表 [ch1, ch2, ...]
+            out_channels (int): 融合后输出通道数，默认256
+        """
+        super().__init__()
+        self.num_levels = len(in_channels_list)
+        self.out_channels = out_channels
 
 
+        # 自适应权重生成网络
+        self.weight_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(self.out_channels, self.out_channels // w_reduction, 1),
+            nn.ReLU(),
+            nn.Conv2d(out_channels // w_reduction, self.num_levels, 1),
+            nn.Softmax(dim=1)
+        )
+
+        # 特征增强模块
+        self.enhance = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels // enh_reduction, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(out_channels // enh_reduction, out_channels, 3, padding=1)
+        )
+    def forward(self, aligned_feats, base_feature):
+        """
+        Args:
+            features (list): 多级特征列表 [feat1, feat2, ...]
+            base_feature (Tensor): 基准特征，用于权重生成和尺寸对齐
+
+        Returns:
+            Tensor: 融合后的特征
+        """
+
+        # # 2. 生成空间自适应权重
+        weights = self.weight_net(base_feature)  # [B, K, 1, 1]
+        weights = weights.squeeze(-1).squeeze(-1)  # [B, K]
+
+        # 3. 加权融合
+        fused = th.zeros_like(base_feature)
+        for i, feat in enumerate(aligned_feats):
+            weight_map = weights[:, i].view(-1, 1, 1, 1)  # [B, 1, 1, 1]
+            fused += weight_map * feat
+        # fused = sum(aligned_feats)
+        # 4. 特征增强 (残差连接)
+        # return self.enhance(fused) + fused + base_feature
+        return  fused + base_feature
+
+
+class SCAttentionAFPF(nn.Module):
+    def __init__(self, in_channels_list, out_channels=256, reduction=8):
+        super().__init__()
+        self.num_levels = len(in_channels_list)
+
+        # 空间注意力
+        self.spatial_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(2, 1, 7, padding=3),
+                nn.Sigmoid()
+            ) for _ in range(self.num_levels)
+        ])
+
+        # 通道注意力
+        self.channel_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(out_channels, out_channels // reduction, 1),
+                nn.ReLU(),
+                nn.Conv2d(out_channels // reduction, out_channels, 1),
+                nn.Sigmoid()
+            ) for _ in range(self.num_levels)
+        ])
+
+
+
+    def forward(self,aligned_feats, base_feature):
+        fused = th.zeros_like(base_feature)
+        for i,  aligned in enumerate(aligned_feats):
+            # 通道对齐
+            # 空间注意力
+            avg_out = th.mean(aligned, dim=1, keepdim=True)
+            max_out, _ = th.max(aligned, dim=1, keepdim=True)
+            spatial_attn = self.spatial_attention[i](th.cat([avg_out, max_out], dim=1))
+
+            # 通道注意力
+            channel_attn = self.channel_attention[i](aligned)
+
+            # 应用双重注意力
+            attended = aligned * spatial_attn * channel_attn
+            fused += attended
+
+        # 自适应融合
+        return fused + base_feature
 
 
 class MultiScaleAttentionAFPF(AFPF):

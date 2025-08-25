@@ -192,7 +192,8 @@ class TrainerBase:
             self.iters_start = 0
 
     def setup_optimizaton(self):
-        self.optimizer = torch.optim.AdamW(self.model.parameters(),
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(trainable_params,
                                            lr=self.configs.train.lr,
                                            weight_decay=self.configs.train.weight_decay)
 

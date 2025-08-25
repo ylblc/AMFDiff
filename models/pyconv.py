@@ -158,7 +158,7 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         identity = x
         out = self.pyconv(x)
         out = self.relu(out)
-
+        out = identity + out
         # 第一种：
         # 数值安全处理
         out_safe = torch.clamp(out, min=self.eps)
