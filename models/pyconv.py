@@ -140,12 +140,11 @@ class PyConv3SERes(nn.Module):
         out= out*self.se(out)
         x = self.skip(x)
         return out + x  # 残差相加
-
-class PyConv3AdaptiveSEResDP(nn.Module):
-    def __init__(self, inplans, planes,layer_depth =None, max_depth=None,drop_prob=0.1,*args):
-        super(PyConv3AdaptiveSEResDP, self).__init__()
-        self.pyconv = PyConv3(inplans, planes,*args)
-        self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
+class PyConv3AdaptiveSEResDP0(nn.Module):
+    def __init__(self, inplans, planes, layer_depth=None, max_depth=None, drop_prob=0.1, *args):
+        super(PyConv3AdaptiveSEResDP0, self).__init__()
+        self.pyconv = PyConv3(inplans, planes, *args)
+        self.skip = conv(inplans, planes, kernel_size=1, padding=0) if inplans != planes else nn.Identity()
         self.se = SELayer(planes)
         self.relu = nn.LeakyReLU(inplace=True)
         self.layer_depth = layer_depth
@@ -153,6 +152,37 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         self.drop_prob = drop_prob
         self.drop_path = DropPath(self.drop_prob) if self.drop_prob > 0 else nn.Identity()
         self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.eps = 1e-6  # 数值安全阈值
+    def forward(self, x):
+        identity = x
+        out = self.pyconv(x)
+        out = self.relu(out)
+        # 第一种：
+        # 数值安全处理
+        out_safe = torch.clamp(out, min=self.eps)
+        # 计算幂次项
+        alpha = torch.pow(out_safe, self.alpha)
+        # 增强控制
+        out = alpha * self.se(out)
+
+        # 第二种：
+        # out = self.alpha * self.se(out)
+
+        identity = self.skip(identity)
+        out = self.drop_path(out) + identity
+        return out
+class PyConv3AdaptiveSEResDP(nn.Module):
+    def __init__(self, inplans, planes, layer_depth=None, max_depth=None, drop_prob=0.1, *args):
+        super(PyConv3AdaptiveSEResDP, self).__init__()
+        self.pyconv = PyConv3(inplans, planes, *args)
+        self.skip = conv(inplans, planes, kernel_size=1, padding=0) if inplans != planes else nn.Identity()
+        self.se = SELayer(planes)
+        self.relu = nn.LeakyReLU(inplace=True)
+        self.layer_depth = layer_depth
+        self.max_depth = max_depth
+        self.drop_prob = drop_prob
+        self.drop_path = DropPath(self.drop_prob) if self.drop_prob > 0 else nn.Identity()
+        self.alpha = nn.Parameter(torch.tensor([0.5]))
         self.eps = 1e-6  # 数值安全阈值
     def forward(self, x):
         identity = x
@@ -173,56 +203,6 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         identity = self.skip(identity)
         out = self.drop_path(out) + identity
         return out
-# 对drop_path的尝试
-class PyConv3AdaptiveSEResDP2(nn.Module):
-    def __init__(self, inplans, planes,layer_depth =None, max_depth=None,drop_prob=0.1,*args):
-        super(PyConv3AdaptiveSEResDP2, self).__init__()
-        self.pyconv = PyConv3(inplans, planes,*args)
-        self.skip = conv(inplans, planes, kernel_size=1,padding=0) if inplans != planes else nn.Identity()
-        self.se = SELayer(planes)
-        self.relu = nn.LeakyReLU(inplace=True)
-        self.layer_depth = layer_depth
-        self.max_depth = max_depth
-        self.drop_prob = drop_prob
-        if self.layer_depth is not None and max_depth is not None and drop_prob != 0.0 :
-            if max_depth > 1:
-                min_drop_prob = 0.01  # 防止概率为0
-                # 深度特定配置
-                if max_depth == 2:
-                    k = 9
-                    cap = 0.25
-                elif max_depth == 3:
-                    k = 7
-                    cap = 0.3
-                else:  # max_depth == 4
-                    k = 5
-                    cap = 0.3
-                # 针对浅层网络的专用公式
-                depth_ratio = layer_depth / max_depth
-                # 核心改进：使用S形曲线代替幂函数
-                # k曲线陡峭度参数
-                s_curve = 1 / (1 + np.exp(-k * (depth_ratio - 0.5)))  # S形曲线
-                # 基础概率计算
-                base_prob = self.drop_prob * s_curve
-                # 应用约束条件
-                computed_drop_prob = max(min_drop_prob, min(base_prob, cap))
-                self.drop_path = DropPath(computed_drop_prob)
-            else:
-                self.drop_path = nn.Identity()
-        else:
-            self.drop_path = nn.Identity()
-
-        self.alpha=nn.Parameter(torch.ones(1))
-
-    def forward(self, x):
-        identity = x
-        out = self.pyconv(x)
-        out = self.relu(out)
-        # 增强控制
-        out = self.alpha * self.se(out)
-
-        identity = self.skip(identity)
-        return self.drop_path(out) + identity
 # 通道注意力
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):

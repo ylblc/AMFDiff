@@ -26,8 +26,34 @@ autoencoder:
       dropout: 0.0
       padding_mode: zeros
 
+#tmodel:
+#  target: models.unet.UNetModelSwin
+#  #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
+#  ckpt_path: weights/resshift_realsrx4_s4_v3.pth
+#  params:
+#    image_size: 64
+#    in_channels: 3
+#    model_channels: 160
+#    out_channels: ${autoencoder.params.embed_dim}
+#    attention_resolutions: [64,32,16,8]
+#    dropout: 0
+#    channel_mult: [1, 2, 2, 4]
+#    num_res_blocks: [2, 2, 2, 2]
+#    conv_resample: True
+#    dims: 2
+#    use_fp16: False
+#    num_head_channels: 32
+#    use_scale_shift_norm: True
+#    resblock_updown: False
+#    swin_depth: 2
+#    swin_embed_dim: 192
+#    window_size: 8
+#    mlp_ratio: 4
+#    cond_lq: True
+#    lq_size: 64
+
 model:
-  target: models.unet.UNetModelSwinPyConv2
+  target: models.unet.UNetModelSwinPyConv4
   #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
   ckpt_path: ~
   params:
@@ -37,8 +63,8 @@ model:
     out_channels: ${autoencoder.params.embed_dim}
     attention_resolutions: [64,32,16,8]
     dropout: 0
-    channel_mult: [1, 2, 2, 4]
-    num_res_blocks: [2, 2, 2, 2]
+    channel_mult: [1, 2,2,4 ]
+    num_res_blocks: [2, 2,2,2 ]
     conv_resample: True
     dims: 2
     use_fp16: False

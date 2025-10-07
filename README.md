@@ -74,7 +74,8 @@ python app.py
 
 ```
 python inference_resshift.py -i testdata/RealSet65/0014.jpg -o result --task realsr --scale 4 --version v3
-python inference_resshift.py" -i testdata/RealSet65/0014.jpg -o result --task realsr --scale 4 --version v3 --cfg_path configs/realsr_swinunet_realesrgan256_my.yaml
+python inference_resshift.py -i testdata/RealSet65/0014.jpg -o result --task realsr --scale 4 --version v3 --cfg_path configs/realsr_swinunet_realesrgan256_my.yaml
+ python inference_resshift.py -i testdata/Set14/image_SRF_4/lq -o result/no-no-mfr/set14 --task realsr --scale 4 --version v3 --cfg_path configs/realsr_swinunet_realesrgan256_test.yaml                                  
 python inference_resshift.py -i [image folder/image path] -o [result folder] --task realsr --scale 4 --version v3
 ```
 #### :lion: Bicubic (resize by Matlab) image super-resolution

@@ -18,23 +18,24 @@ from utils import util_image
 
 def main():
     parser = argparse.ArgumentParser()
+    mode = 'testing' # 'testing' | "training"
     parser.add_argument(
             "-i",
             "--indir",
             type=str,
-            default="/mnt/lustre/share/zhangwenwei/data/imagenet/val",
+            default="../testdata/Val_SR/gt",
             help="Folder to save the checkpoints and training log",
             )
     parser.add_argument(
             "-o",
             "--outdir",
             type=str,
-            default="./ImageNet-Test",
-            help="Folder to save the checkpoints and training log",
+            default="./val_sr_testing",
+            help="Folder to save the checrpoints and training log",
             )
     args = parser.parse_args()
 
-    img_list = sorted([x for x in Path(args.indir).glob('**/*.JPEG')])
+    img_list = sorted([x for x in Path(args.indir).glob('**/*.png')])
     print(f'Number of images in imagenet validation dataset: {len(img_list)}')
 
     random.seed(10000)
@@ -47,12 +48,13 @@ def main():
     if not lq_dir.exists():
         lq_dir.mkdir(parents=True)
 
-    num_imgs = 3000
-    configs = OmegaConf.load('./configs/degradation_testing_realesrgan.yaml')
+    # num_imgs = 3000
+    num_imgs = len(img_list)
+    configs = OmegaConf.load('../configs/degradation_testing_realesrgan.yaml')
     opts, opts_degradation = configs.opts, configs.degradation
     opts['dir_paths'] = [args.indir, ]
     opts['length'] = num_imgs
-    dataset = RealESRGANDataset(opts, mode='testing')
+    dataset = RealESRGANDataset(opts, mode=mode)
     for ii in range(num_imgs):
         data_dict1 = dataset.__getitem__(ii)
         if (ii + 1) % 100 == 0:

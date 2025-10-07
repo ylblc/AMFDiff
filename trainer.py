@@ -7,11 +7,14 @@ import lpips
 import numpy as np
 from pathlib import Path
 from loguru import logger
-from copy import deepcopy
+from copy import deepcopy, copy
 from omegaconf import OmegaConf
 from collections import OrderedDict
 from einops import rearrange
 from contextlib import nullcontext
+
+# import optuna
+# from transformers.models.prophetnet.modeling_prophetnet import softmax
 
 from datapipe.datasets import create_dataset
 from ldm.modules.diffusionmodules.util import mean_flat
@@ -45,7 +48,6 @@ class TrainerBase:
 
         # setup seed
         self.setup_seed()
-
     def setup_dist(self):
         num_gpus = torch.cuda.device_count()
 
@@ -201,6 +203,30 @@ class TrainerBase:
         self.amp_scaler = amp.GradScaler() if self.configs.train.use_amp else None
 
     def build_model(self):
+        self.tmodel=None
+        if hasattr(self.configs, 'tmodel'):
+            params = self.configs.tmodel.get('params', dict)
+            tmodel = util_common.get_obj_from_str(self.configs.tmodel.target)(**params)
+            tmodel.cuda()
+            if self.configs.tmodel.ckpt_path is not None:
+                tckpt_path = self.configs.tmodel.ckpt_path
+                if self.rank == 0:
+                    self.logger.info(f"Initializing Teacher model from {tckpt_path}")
+                tckpt = torch.load(tckpt_path, map_location=f"cuda:{self.rank}")
+                if 'state_dict' in tckpt:
+                    tckpt = tckpt['state_dict']
+                util_net.reload_model(tmodel, tckpt)
+            if self.configs.train.compile.flag:
+                if self.rank == 0:
+                    self.logger.info("Begin compiling model...")
+                tmodel = torch.compile(tmodel, mode=self.configs.train.compile.mode)
+                if self.rank == 0:
+                    self.logger.info("Compiling Done")
+            if self.num_gpus > 1:
+                self.tmodel = DDP(tmodel, device_ids=[self.rank, ], static_graph=False)  # wrap the network
+            else:
+                self.tmodel = tmodel
+            self.tmodel.eval()
         params = self.configs.model.get('params', dict)
         model = util_common.get_obj_from_str(self.configs.model.target)(**params)
         model.cuda()
@@ -222,7 +248,6 @@ class TrainerBase:
             self.model = DDP(model, device_ids=[self.rank,], static_graph=False)  # wrap the network
         else:
             self.model = model
-
         # EMA
         if self.rank == 0 and hasattr(self.configs.train, 'ema_rate'):
             self.ema_model = deepcopy(model).cuda()
@@ -785,7 +810,7 @@ class TrainerDifIR(TrainerBase):
         micro_batchsize = self.configs.train.microbatch
         num_grad_accumulate = math.ceil(current_batchsize / micro_batchsize)
 
-        for jj in range(0, current_batchsize, micro_batchsize):
+        for jj in range(0, current_batchsize,micro_batchsize ):
             micro_data = {key:value[jj:jj+micro_batchsize,] for key, value in data.items()}
             last_batch = (jj+micro_batchsize >= current_batchsize)
             tt = torch.randint(
@@ -811,7 +836,7 @@ class TrainerDifIR(TrainerBase):
                 model_kwargs = None #compute_losses() = [terms, z_t, pred_zstart]
             compute_losses = functools.partial(
                 self.base_diffusion.training_losses,
-                self.model,
+                self.model,self.tmodel,
                 micro_data['gt'],
                 micro_data['lq'],
                 tt,
@@ -824,7 +849,6 @@ class TrainerDifIR(TrainerBase):
             else:
                 with self.model.no_sync():
                     losses, z0_pred, z_t = self.backward_step(compute_losses, micro_data, num_grad_accumulate, tt)
-
             # make logging
             if last_batch:
                 self.log_step_train(losses, tt, micro_data, z_t, z0_pred.detach())
@@ -840,10 +864,8 @@ class TrainerDifIR(TrainerBase):
             self.amp_scaler.update()
         else:
             self.optimizer.step()
-
         # grad zero
         self.model.zero_grad()
-
         if hasattr(self.configs.train, 'ema_rate'):
             self.update_ema_model()
 
@@ -1010,7 +1032,7 @@ class TrainerDifIR(TrainerBase):
             if 'gt' in data:
                 mean_psnr /= len(self.datasets[phase])
                 mean_lpips /= len(self.datasets[phase])
-                self.logger.info(f'Validation Metric: PSNR={mean_psnr:5.2f}, LPIPS={mean_lpips:6.4f}...')
+                self.logger.info(f'Validation Metric: PSNR={mean_psnr:5.4f}, LPIPS={mean_lpips:6.6f}...')
                 self.logging_metric(mean_psnr, tag='PSNR', phase=phase, add_global_step=False)
                 self.logging_metric(mean_lpips, tag='LPIPS', phase=phase, add_global_step=True)
 
@@ -1024,13 +1046,114 @@ class TrainerDifIR(TrainerBase):
 
 class TrainerDifIRLPIPS(TrainerDifIR):
 
+    def validation(self, phase='val'):
+        if self.rank == 0:
+            if self.configs.train.use_ema_val:
+                self.reload_ema_model()
+                self.ema_model.eval()
+            else:
+                self.model.eval()
+
+            indices = np.linspace(
+                0,
+                self.base_diffusion.num_timesteps,
+                self.base_diffusion.num_timesteps if self.base_diffusion.num_timesteps < 5 else 4,
+                endpoint=False,
+                dtype=np.int64,
+            ).tolist()
+            if not (self.base_diffusion.num_timesteps - 1) in indices:
+                indices.append(self.base_diffusion.num_timesteps - 1)
+            batch_size = self.configs.train.batch[1]
+            num_iters_epoch = math.ceil(len(self.datasets[phase]) / batch_size)
+            mean_psnr = mean_lpips = 0
+            for ii, data in enumerate(self.dataloaders[phase]):
+                data = self.prepare_data(data, phase='val')
+                if 'gt' in data:
+                    im_lq, im_gt = data['lq'], data['gt']
+                else:
+                    im_lq = data['lq']
+                num_iters = 0
+                if self.configs.model.params.cond_lq:
+                    model_kwargs = {'lq': data['lq'], }
+                    if 'mask' in data:
+                        model_kwargs['mask'] = data['mask']
+                else:
+                    model_kwargs = None
+                tt = torch.tensor(
+                    [self.base_diffusion.num_timesteps, ] * im_lq.shape[0],
+                    dtype=torch.int64,
+                ).cuda()
+                for sample in self.base_diffusion.p_sample_loop_progressive(
+                        y=im_lq,
+                        model=self.ema_model if self.configs.train.use_ema_val else self.model,
+                        first_stage_model=self.autoencoder,
+                        noise=None,
+                        clip_denoised=True if self.autoencoder is None else False,
+                        model_kwargs=model_kwargs,
+                        device=f"cuda:{self.rank}",
+                        progress=False,
+                ):
+                    sample_decode = {}
+                    if num_iters in indices:
+                        for key, value in sample.items():
+                            if key in ['sample', ]:
+                                sample_decode[key] = self.base_diffusion.decode_first_stage(
+                                    value,
+                                    self.autoencoder,
+                                ).clamp(-1.0, 1.0)
+                        im_sr_progress = sample_decode['sample']
+                        if num_iters + 1 == 1:
+                            im_sr_all = im_sr_progress
+                        else:
+                            im_sr_all = torch.cat((im_sr_all, im_sr_progress), dim=1)
+                    num_iters += 1
+                    tt -= 1
+
+                if 'gt' in data:
+                    mean_psnr += util_image.batch_PSNR(
+                        sample_decode['sample'] * 0.5 + 0.5,
+                        im_gt * 0.5 + 0.5,
+                        ycbcr=self.configs.train.val_y_channel,
+                    )
+                    mean_lpips += self.lpips_loss(
+                        sample_decode['sample'],
+                        im_gt,
+                    ).sum().item()
+
+                if (ii + 1) % self.configs.train.log_freq[2] == 0:
+                    self.logger.info(f'Validation: {ii + 1:02d}/{num_iters_epoch:02d}...')
+
+                    im_sr_all = rearrange(im_sr_all, 'b (k c) h w -> (b k) c h w', c=im_lq.shape[1])
+                    self.logging_image(
+                        im_sr_all,
+                        tag='progress',
+                        phase=phase,
+                        add_global_step=False,
+                        nrow=len(indices),
+                    )
+                    if 'gt' in data:
+                        self.logging_image(im_gt, tag='gt', phase=phase, add_global_step=False)
+                    self.logging_image(im_lq, tag='lq', phase=phase, add_global_step=True)
+
+            if 'gt' in data:
+                mean_psnr /= len(self.datasets[phase])
+                mean_lpips /= len(self.datasets[phase])
+                self.logger.info(f'Validation Metric: PSNR={mean_psnr:5.4f}, LPIPS={mean_lpips:6.6f}...')
+                self.logging_metric(mean_psnr, tag='PSNR', phase=phase, add_global_step=False)
+                self.logging_metric(mean_lpips, tag='LPIPS', phase=phase, add_global_step=True)
+            self.logger.info("=" * 100)
+            if not (self.configs.train.use_ema_val and hasattr(self.configs.train, 'ema_rate')):
+                self.model.train()
+            return mean_psnr, mean_lpips
+        return None, None
+
     # 期刊损失函数，新版
     def backward_step(self, dif_loss_wrapper, micro_data, num_grad_accumulate, tt):
         loss_coef = self.configs.train.get('loss_coef') #  [mse, lpips]
         context = torch.cuda .amp.autocast if self.configs.train.use_amp else nullcontext
         # diffusion loss
         with context():
-            losses, z_t, z0_pred = dif_loss_wrapper()
+            losses, z_t, z0_pred,z_start = dif_loss_wrapper()
 
             x0_pred = self.base_diffusion.decode_first_stage(
                     z0_pred,
@@ -1060,16 +1183,311 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                 losses["loss"] = losses["mse"]
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
-            # # ssim 损失函数 轻微提升
-            # ssim_loss = self.multi_scale_ssim_loss(x0_pred, micro_data['gt'])
+            ws = self.model.ws
+            prior_loss = 0.1 * self.prior_att_loss(ws)
+            losses['prior'] = prior_loss
+            losses['loss'] += prior_loss
+            loss = losses['loss'].mean() / num_grad_accumulate
+        if self.amp_scaler is None:
+            loss.backward()
+        else:
+            self.amp_scaler.scale(loss).backward()
+        return losses, z0_pred, z_t
 
-            # skip_loss = torch.zeros_like(losses["loss"])
-            # computed_indexs = [i for i in range( 3*len(self.configs.model.params.channel_mult))][::3]
-            # for i, (res_h,multi_h,skip_h,final_h) in enumerate(self.model.get_skip_features()):
-            #     if i in computed_indexs:
-            #         skip_loss += self.variance_based_loss(res_h,skip_h)
-            # losses['loss'] += skip_loss
-            # losses['loss'] +=  0.5 * ssim_loss
+    def prior_att(self):
+        ws = self.model.ws
+        s=""
+        for i, row in enumerate(ws):
+            row_s=""
+            for j, col in enumerate(row):
+                arr1 = [round(x,4) for x in col.mean(dim=0).tolist()]
+                row_s+=f'Decoder({i},{j})={arr1}  '
+            s+=row_s+"\n"
+        self.logger.info(s)
+    def prior_att_loss(self,ws):
+        prior_loss = 0
+        consistency_loss = 0
+        target=[]
+        num_encoder = num_decoder = len(ws)
+        for i in range(num_decoder):
+            # 生成平滑的目标分布（距离目标层越近，权重越高）
+            target_row = []
+            target_encoder_layer = num_encoder - 1 - i
+            for encoder_layer in range(num_encoder):
+                distance = torch.tensor(abs(encoder_layer - target_encoder_layer))
+                weight = torch.exp(-distance / 1.2)  # 1.2为平滑系数，可调整
+                target_row.append(weight)
+            target.append(torch.tensor(target_row).to(ws[0][0].device).repeat(ws[0][0].size(0),1))
+        for i,row in enumerate(ws):
+            for j,col in enumerate(row):
+                prior_loss += mean_flat((col -target[i])**2)
+                position_variance=torch.var(torch.stack(row).permute(1,0,2),dim=1) # torch.stack(row)=[num_resblocks,bs,encoders] -> torch.stack(row).permute(1,0,2)=[bs,num_resblocks,encoders]
+                consistency_loss+= torch.mean(position_variance,dim=1) # (4,)
+        return  prior_loss + 0.1 * consistency_loss
+    def prior_att_loss2(self, ws):
+        """
+        适配ws结构的注意力损失函数：强化层级递进与同层一致性
+        ws结构：(解码器层, resblock数量, 注意力权重tensor)
+            - 解码器层：0=最深层（靠近瓶颈），num_decoder-1=最顶层（靠近输出）
+            - 注意力权重tensor：shape=(batch_size, num_encoder)，每个元素对应编码器0~3层的权重
+
+        返回：
+            总损失 = 先验分布损失（层级递进） + 一致性损失（同层resblock）* 权重
+        """
+        # 初始化损失
+        prior_loss = 0.0
+        consistency_loss = 0.0
+
+        # 解析ws的维度信息
+        num_decoder = len(ws)  # 解码器层数
+        if num_decoder == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        num_resblocks = len(ws[0])  # 每层的resblock数量
+        batch_size, num_encoder = ws[0][0].shape  # 批次大小和编码器层数
+        device = ws[0][0].device  # 设备一致性
+
+        # 生成目标分布：解码器深层（ws[0]）关注编码器深层，顶层关注编码器浅层
+        targets = []
+        for decoder_layer in range(num_decoder):
+            # 解码器层与目标编码器层的映射：
+            # decoder_layer=0（最深）→ 关注encoder最深层（num_encoder-1）
+            # decoder_layer增大（靠近输出）→ 关注的encoder层减小（靠近输入）
+            target_encoder_layer = num_encoder - 1 - decoder_layer
+
+            # 生成平滑的目标分布（距离目标层越近，权重越高）
+            target_row = []
+            for encoder_layer in range(num_encoder):
+                distance = abs(encoder_layer - target_encoder_layer)
+                weight = torch.exp(-distance / 1.2)  # 1.2为平滑系数，可调整
+                target_row.append(weight)
+
+            # 归一化确保是合法分布
+            target_row = torch.tensor(target_row, device=device)
+            target_row = target_row / target_row.sum()
+
+            # 扩展到批次维度：(batch_size, num_encoder)
+            targets.append(target_row.repeat(batch_size, 1))
+
+        # 计算先验损失：每个resblock的注意力与目标分布的差距
+        for decoder_layer in range(num_decoder):
+            target = targets[decoder_layer]  # 当前解码器层的目标分布
+            for resblock_idx in range(num_resblocks):
+                # 获取当前resblock的注意力权重：(batch_size, num_encoder)
+                att = ws[decoder_layer][resblock_idx]
+
+                # 用KL散度衡量分布差异（比MSE更适合概率分布）
+                prior_loss += torch.mean(
+                    torch.nn.functional.kl_div(
+                        att.log_softmax(dim=-1),  # 确保输入是log概率
+                        target.softmax(dim=-1),  # 目标分布的概率形式
+                        reduction='none'
+                    ).sum(dim=-1)  # 对编码器层维度求和
+                )
+
+        # 计算同层一致性损失：同一解码器层内不同resblock的注意力应相似
+        for decoder_layer in range(num_decoder):
+            # 收集当前解码器层所有resblock的注意力：(num_resblocks, batch_size, num_encoder)
+            resblock_atts = torch.stack([ws[decoder_layer][rb] for rb in range(num_resblocks)])
+
+            # 调整维度为：(batch_size, num_resblocks, num_encoder)
+            resblock_atts = resblock_atts.permute(1, 0, 2)
+
+            # 计算同一批次中，各resblock在编码器层上的方差（方差越小一致性越高）
+            resblock_var = torch.var(resblock_atts, dim=1)  # (batch_size, num_encoder)
+
+            # 平均得到当前解码器层的一致性损失
+            consistency_loss += torch.mean(resblock_var)
+
+        # 损失权重：增强一致性约束（根据实际效果可调整）
+        consistency_weight = 0.1
+
+        # 返回总损失（平均到每个解码器层和resblock，避免批次影响）
+        total_loss = (prior_loss / (num_decoder * num_resblocks)) + (consistency_weight * consistency_loss / num_decoder)
+
+        return total_loss
+    def log_step_train(self, loss, tt, batch, z_t, z0_pred, phase='train'):
+        '''
+        param loss: a dict recording the loss informations
+        param tt: 1-D tensor, time steps
+        '''
+        if self.rank == 0:
+            chn = batch['gt'].shape[1]
+            num_timesteps = self.base_diffusion.num_timesteps
+            record_steps = [1, (num_timesteps // 2) + 1, num_timesteps]
+            if self.current_iters % self.configs.train.log_freq[0] == 1:
+                self.loss_mean = {key:torch.zeros(size=(len(record_steps),), dtype=torch.float64)
+                                  for key in loss.keys()}
+                self.loss_count = torch.zeros(size=(len(record_steps),), dtype=torch.float64)
+            for jj in range(len(record_steps)):
+                for key, value in loss.items():
+                    index = record_steps[jj] - 1
+                    mask = torch.where(tt == index, torch.ones_like(tt), torch.zeros_like(tt))
+                    assert value.shape == mask.shape
+                    current_loss = torch.sum(value.detach() * mask)
+                    self.loss_mean[key][jj] += current_loss.item()
+                self.loss_count[jj] += mask.sum().item()
+
+            if self.current_iters % self.configs.train.log_freq[0] == 0:
+                if torch.any(self.loss_count == 0):
+                    self.loss_count += 1e-4
+                for key in loss.keys():
+                    self.loss_mean[key] /= self.loss_count
+                log_str = 'Train: {:06d}/{:06d}, MSE/LPIPS/Prior: '.format(
+                        self.current_iters,
+                        self.configs.train.iterations)
+                for jj, current_record in enumerate(record_steps):
+                    log_str += 't({:d}):{:.5e}/{:.5e}/{:.5e}, '.format(
+                            current_record,
+                            self.loss_mean['mse'][jj].item(),
+                            self.loss_mean['lpips'][jj].item(),
+                            self.loss_mean['prior'][jj].item(),
+                            )
+                log_str += 'lr:{:.2e}'.format(self.optimizer.param_groups[0]['lr'])
+                self.logger.info(log_str)
+                self.logging_metric(self.loss_mean, tag='Loss', phase=phase, add_global_step=True)
+            if self.current_iters % self.configs.train.log_freq[1] == 0:
+                self.logging_image(batch['lq'], tag='lq', phase=phase, add_global_step=False)
+                self.logging_image(batch['gt'], tag='gt', phase=phase, add_global_step=False)
+                x_t = self.base_diffusion.decode_first_stage(
+                        self.base_diffusion._scale_input(z_t, tt),
+                        self.autoencoder,
+                        )
+                self.logging_image(x_t, tag='diffused', phase=phase, add_global_step=False)
+                self.logging_image(self.current_x0_pred, tag='x0-pred', phase=phase, add_global_step=True)
+
+            if self.current_iters % self.configs.train.save_freq == 1:
+                self.tic = time.time()
+            if self.current_iters % self.configs.train.save_freq == 0:
+                self.toc = time.time()
+                elaplsed = (self.toc - self.tic)
+                self.prior_att()
+                self.logger.info(f"Elapsed time: {elaplsed:.2f}s")
+                self.logger.info("="*100)
+
+
+
+class TrainerDifIROptuna(TrainerDifIR):
+    def __init__(self, configs):
+        super().__init__(configs)
+        self.param = None
+    def train(self,trial):
+        param = {
+
+            "lr_min":trial.suggest_float("lr_min",1e-7,1e-5,log=True),
+            "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
+            "lr_schedule": trial.suggest_categorical("lr_schedule", ['cosin', 'cosinRestarts']),
+            "loss_coef_mse":trial.suggest_float("loss_coef_mse",0.01,2.0),
+            "loss_coef_lpips": trial.suggest_float("loss_coef_lpips", 0.1, 2.0),
+            "warmup_iterations": trial.suggest_int('warmup_iterations', 1000, 10000)  ,
+        }
+        self.param = param
+        self.init_logger()       # setup logger: self.logger
+
+        self.build_model()       # build model: self.model, self.loss
+
+        self.setup_optimizaton() # setup optimization: self.optimzer, self.sheduler
+
+        self.resume_from_ckpt()  # resume if necessary
+
+        self.build_dataloader()  # prepare data: self.dataloaders, self.datasets, self.sampler
+        # UNetModelSwin 训练模式
+        self.model.train()
+        shanghai_tz=datetime.timezone(datetime.timedelta(hours=+8))
+        current_time = datetime.datetime.now(shanghai_tz).strftime('%Y-%m-%d %H:%M:%S')
+        self.logger.info(f'开始时间： {current_time}')
+        best_mean_psnr,best_mean_lpips=0,float('inf')
+        # patience = self.configs.train.early_stop_num  # 允许连续patience轮验证指标未改善
+        patience = 8
+        wait = 0
+
+
+        num_iters_epoch = math.ceil(len(self.datasets['train']) / self.configs.train.batch[0])
+        for ii in range(self.iters_start, self.configs.train.iterations):
+            self.current_iters = ii + 1
+
+            # prepare data,self.dataloaders 包含 self.dataloaders.train and self.dataloaders.val
+            data = self.prepare_data(next(self.dataloaders['train']))
+
+            # training phase
+            self.training_step(data)
+
+            mean_psnr,mean_lpips=None,None
+            # validation phase
+            if 'val' in self.dataloaders and (ii+1) % self.configs.train.get('val_freq', 10000) == 0:
+                mean_psnr,mean_lpips=self.validation()
+
+            #update learning rate
+            self.adjust_lr()
+
+            # save checkpoint
+            if (ii+1) % self.configs.train.save_freq == 0:
+                if mean_psnr is not None and mean_lpips is not None:
+                    # 两个指标同时变差
+                    if mean_psnr < best_mean_psnr and mean_lpips > best_mean_lpips:
+                        wait += 1
+                        self.logger.error(f"Metric decrease warning ({wait}/{patience})  at epoch [{ii+1}]，case: psnr={mean_psnr:5.2f}, lpips={mean_lpips:6.4f}")
+                        if wait >= patience:
+                            self.logger.error(f"Early stopping at epoch [{ii+1}]")
+                            break
+                        self.logger.info("="*100)
+                    else:
+                        # 最好指标
+                        if mean_psnr >= best_mean_psnr and mean_lpips <= best_mean_lpips:
+                            best_mean_psnr = mean_psnr
+                            best_mean_lpips = mean_psnr
+                            self.save_ckpt(f"model_best_{self.current_iters}.pth")
+                        wait = 0
+                        self.save_ckpt()
+                else:
+                    self.save_ckpt()
+
+            if (ii+1) % num_iters_epoch == 0 and self.sampler is not None:
+                self.sampler.set_epoch(ii+1)
+        psnr, lpips = self.validation()
+        # close the tensorboard
+        self.close_logger()
+
+        return psnr,lpips
+    # 期刊损失函数，新版
+    def backward_step(self, dif_loss_wrapper, micro_data, num_grad_accumulate, tt):
+        loss_coef = self.configs.train.get('loss_coef') #  [mse, lpips]
+        context = torch.cuda .amp.autocast if self.configs.train.use_amp else nullcontext
+        # diffusion loss
+        with context():
+            losses, z_t, z0_pred = dif_loss_wrapper()
+
+            x0_pred = self.base_diffusion.decode_first_stage(
+                    z0_pred,
+                    self.autoencoder,
+                    ) # f16
+            self.current_x0_pred = x0_pred.detach()
+
+            # lpips loss
+            losses["lpips"] = self.lpips_loss(
+                    x0_pred,
+                    micro_data['gt'],
+                    ).to(z0_pred.dtype).view(-1)
+            flag_nan = torch.any(torch.isnan(losses["lpips"]))
+            if flag_nan:
+                losses["lpips"] = torch.nan_to_num(losses["lpips"], nan=0.0)
+            # losses["lpips"] *= loss_coef[1]
+            losses['lpips'] *= self.param['loss_coef_lpips']
+
+            if loss_coef[0] > 0:    # calculate mse in latent space
+                # losses["mse"] *= loss_coef[0]
+                losses['mse'] *= self.param['loss_coef_mse']
+            else:                   # calculate mse in pixel space
+                assert loss_coef[2] > 0
+                losses["mse"] = mean_flat((x0_pred - micro_data['gt']) ** 2)
+                losses["mse"] *= loss_coef[2]
+
+            assert losses["mse"].shape == losses["lpips"].shape
+            if flag_nan:
+                losses["loss"] = losses["mse"]
+            else:
+                losses["loss"] = losses["mse"] + losses["lpips"]
+
             loss = losses['loss'].mean() / num_grad_accumulate
         if self.amp_scaler is None:
             loss.backward()
@@ -1079,78 +1497,37 @@ class TrainerDifIRLPIPS(TrainerDifIR):
         return losses, z0_pred, z_t
 
 
-    # 添加一致性约束损失
-    def feature_consistency_loss(self,resH, res_skip, final_feature):
-        # 确保融合特征保留原始特征信息
-        loss_resH = F.mse_loss(final_feature, resH.detach())
-        loss_res_skip = F.mse_loss(final_feature, res_skip.detach())
-        return 0.5 * (loss_resH + loss_res_skip)
-
-    # 添加特征相似性损失，但不强制一致性
-    def feature_similarity_loss(self,resH, res_skip, final_feature, alpha=0.01):
-        """
-        鼓励但不强制特征相似性的损失
-        alpha: 控制损失强度，非常小的值
-        """
-        # 计算余弦相似性
-        cos_sim = F.cosine_similarity(resH.detach().flatten(1), final_feature.flatten(1),dim=-1)
-
-        # 只有当特征差异很大时才施加轻微惩罚
-        penalty = torch.relu(0.5 - cos_sim).mean(dim=-1)
-
-        return alpha * penalty
-
-    def multi_scale_ssim_loss(self, pred, target):
-        weights = (0.5, 0.3, 0.2)
-        scales = len(weights)
-        loss = 0
-        for i, weight in enumerate(weights):
-            scale_factor = 1 / (2 ** i)
-
-            # 下采样
-            pred_scaled = F.interpolate(pred, scale_factor=scale_factor, mode='bilinear')
-            target_scaled = F.interpolate(target, scale_factor=scale_factor, mode='bilinear')
-
-            # 计算SSIM损失
-            loss += weight * self.ssim_loss(pred_scaled, target_scaled)
-        flag_nan = torch.any(torch.isnan(loss))
-        if flag_nan:
-            loss = torch.nan_to_num(loss, nan=0.0)
-        return loss
-    def ssim_loss(self,pred, target, window_size=7, C1=0.01 ** 2, C2=0.03 ** 2):
-        """
-        超安全SSIM实现，使用平均池化替代卷积
-        """
-        # 确保输入安全
-        pred = torch.clamp(pred, 0.0, 1.0)
-        target = torch.clamp(target, 0.0, 1.0)
-
-        # 使用平均池化计算局部统计量
-        avg_pool = lambda x: F.avg_pool2d(x, window_size, stride=1, padding=window_size // 2)
-
-        mu_pred = avg_pool(pred)
-        mu_target = avg_pool(target)
-
-        mu_pred_sq = mu_pred * mu_pred
-        mu_target_sq = mu_target * mu_target
-        mu_pred_target = mu_pred * mu_target
-
-        sigma_pred_sq = avg_pool(pred * pred) - mu_pred_sq
-        sigma_target_sq = avg_pool(target * target) - mu_target_sq
-        sigma_pred_target = avg_pool(pred * target) - mu_pred_target
-
-        # 确保方差非负
-        sigma_pred_sq = torch.relu(sigma_pred_sq) + 1e-6
-        sigma_target_sq = torch.relu(sigma_target_sq) + 1e-6
-
-        # 计算SSIM
-        numerator = (2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)
-        denominator = (mu_pred_sq + mu_target_sq + C1) * (sigma_pred_sq + sigma_target_sq + C2)
-
-        ssim_map = numerator / (denominator + 1e-8)
-        return 1 - ssim_map.mean(dim=(1, 2, 3))
-
-
+    def setup_optimizaton(self):
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(trainable_params,
+                                           lr=self.param['lr'],
+                                           weight_decay=self.configs.train.weight_decay)
+        # amp settings
+        self.amp_scaler = amp.GradScaler() if self.configs.train.use_amp else None
+        lr_schedule = self.param['lr_schedule']
+        if lr_schedule == 'cosin':
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer=self.optimizer,
+                T_max=self.configs.train.iterations - self.configs.train.warmup_iterations,
+                eta_min=self.param['lr_min'],
+            )
+        if lr_schedule == 'cosinRestarts':
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer=self.optimizer,
+                T_0=self.configs.train.cycle_iterations,
+                T_mult=self.configs.train.t_mult,
+                eta_min=self.param['lr_min'],
+            )
+    def adjust_lr(self, current_iters=None):
+        base_lr = self.configs.train.lr
+        warmup_steps = self.param['warmup_iterations']
+        current_iters = self.current_iters if current_iters is None else current_iters
+        if current_iters <= warmup_steps:
+            for params_group in self.optimizer.param_groups:
+                params_group['lr'] = (current_iters / warmup_steps) * base_lr
+        else:
+            if hasattr(self, 'lr_scheduler'):
+                self.lr_scheduler.step()
     def log_step_train(self, loss, tt, batch, z_t, z0_pred, phase='train'):
         '''
         param loss: a dict recording the loss informations
@@ -1207,6 +1584,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                 elaplsed = (self.toc - self.tic)
                 self.logger.info(f"Elapsed time: {elaplsed:.2f}s")
                 self.logger.info("="*100)
+
 
 def replace_nan_in_batch(im_lq, im_gt):
     '''

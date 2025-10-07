@@ -529,7 +529,7 @@ class GaussianDiffusion:
         return y + _extract_into_tensor(self.kappa * self.sqrt_etas, t, y.shape) * noise
 
     def training_losses(
-            self, model, x_start, y, t,
+            self, model,tmodel, x_start, y, t,
             first_stage_model=None,
             model_kwargs=None,
             noise=None,
@@ -564,6 +564,9 @@ class GaussianDiffusion:
 
         if self.loss_type == LossType.MSE or self.loss_type == LossType.WEIGHTED_MSE:
             model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
+            if tmodel is not None:
+                with torch.no_grad():
+                    t_model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
             target = {
                 ModelMeanType.START_X: z_start,
                 ModelMeanType.RESIDUAL: z_y - z_start,
@@ -579,6 +582,8 @@ class GaussianDiffusion:
             else:
                 weights = 1
             terms["mse"] *= weights
+            if tmodel is not None:
+                terms["mse"] +=  0.1 * mean_flat(t_model_output - model_output)
         else:
             raise NotImplementedError(self.loss_type)
 
@@ -593,7 +598,7 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.model_mean_type)
 
-        return terms, z_t, pred_zstart
+        return terms, z_t, pred_zstart,z_start
 
     def _scale_input(self, inputs, t):
         if self.normalize_input:

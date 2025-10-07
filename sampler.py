@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
 # Power by Zongsheng Yue 2022-07-13 16:59:27
-
+import datetime
 import os, sys, math, random
 
 import cv2
@@ -55,6 +55,12 @@ class BaseSampler:
         self.setup_seed()
 
         self.build_model()
+        self.wss = []
+        for i in range(4):
+            self.wss.append([])
+            for j in range(3):
+                self.wss[i].append(torch.zeros(size=(4,)).to("cuda"))
+        self.wsl=0
 
     def setup_seed(self, seed=None):
         seed = self.seed if seed is None else seed
@@ -204,9 +210,33 @@ class ResShiftSampler(BaseSampler):
                 progress=False,
                 )    # This has included the decoding for latent space
 
+        # ws = self.model.ws
+        # s=""
+        # for i, row in enumerate(ws):
+        #     row_s=""
+        #     for j, col in enumerate(row):
+        #         self.wss[i][j] += col.mean(dim=0)
+        #
+        #         arr1 = [round(x, 4) for x in col.mean(dim=0).tolist()]
+        #         row_s+=f'Decoder({i},{j})={arr1}  '
+        #     s+=row_s+"\n"
+        # self.wsl +=1
+        # print(s)
+        # print(f"{self.wsl}/32")
         if flag_pad:
             results = results[:, :, :ori_h*self.sf, :ori_w*self.sf]
 
+        # if self.wsl == 32:
+        #     print("="*100)
+        #     print(f"Finish ... avg_attent({self.wsl})")
+        #     s = ""
+        #     for i, row in enumerate(self.wss):
+        #         row_s = ""
+        #         for j, col in enumerate(row):
+        #             arr1 = [round(x/self.wsl, 4) for x in col.tolist()]
+        #             row_s += f'Decoder({i},{j})={arr1}  '
+        #         s += row_s + "\n"
+        #     print(s)
         return results.clamp_(-1.0, 1.0)
 
     def inference(self, in_path, out_path, mask_path=None, mask_back=True, bs=1, noise_repeat=False):
@@ -315,6 +345,8 @@ class ResShiftSampler(BaseSampler):
                     shuffle=False,
                     drop_last=False,
                     )
+            shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
+            start_time = datetime.datetime.now(shanghai_tz)
             for data in dataloader:
                 micro_batchsize = math.ceil(bs / self.num_gpus)
                 ind_start = self.rank * micro_batchsize
@@ -332,9 +364,14 @@ class ResShiftSampler(BaseSampler):
                         im_name = Path(micro_data['path'][jj]).stem
                         im_path = out_path / f"{im_name}.png"
                         util_image.imwrite(im_sr, im_path, chn='bgr', dtype_in='uint8')
+            end_time = datetime.datetime.now(shanghai_tz)
+            duration = (end_time - start_time).total_seconds()
+            self.write_log(f'Duration {duration} s')
             if self.num_gpus > 1:
                 dist.barrier()
         else:
+            shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
+            start_time = datetime.datetime.now(shanghai_tz)
             im_lq = util_image.imread(in_path, chn='rgb', dtype='float32')  # h x w x c
             im_lq_tensor = util_image.img2tensor(im_lq).cuda()              # 1 x c x h x w
             if mask_path is not None:
@@ -349,7 +386,9 @@ class ResShiftSampler(BaseSampler):
             im_sr = util_image.tensor2img(im_sr_tensor, rgb2bgr=True, min_max=(0.0, 1.0))
             im_path = out_path / f"{in_path.stem}.png"
             util_image.imwrite(im_sr, im_path, chn='bgr', dtype_in='uint8')
-
+            end_time = datetime.datetime.now(shanghai_tz)
+            duration = (end_time - start_time).total_seconds()
+            self.write_log(f'Duration {duration} s')
         self.write_log(f"Processing done, enjoy the results in {str(out_path)}")
     def inference2(self, in_path, out_path, mask_path=None, mask_back=True, bs=1, noise_repeat=False):
             '''
