@@ -1182,7 +1182,7 @@ class UNetModelConv(nn.Module):
         out = self.out(h)
         return out
 
-from models.pyconv import PyConv3AdaptiveSEResDP, PyConv3AdaptiveSEResDP0
+from models.pyconv import PyConv3AdaptiveSEResDP, PyConv3AdaptiveSEResDP0, PyConv3AdaptiveSEResDP_lite
 
 
 class UNetModelSwinPyConv(nn.Module):
@@ -3319,7 +3319,7 @@ class UNetModelSwinPyConv5(nn.Module):
                         )
                 ]
                 self.skip_connections[index].append(
-                    PyConv3AdaptiveSEResDP(ich, ich, level + 1, len(channel_mult))
+                    PyConv3AdaptiveSEResDP_lite(ich, ich)
                 )
                 ch = int(model_channels * mult)
 
@@ -3395,11 +3395,11 @@ class UNetModelSwinPyConv5(nn.Module):
                 )
                 if i == 0:
                     self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_length,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]),time_emb_dim=time_embed_dim)
+                        AdaptiveFeatureSelect3(layer_length,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]))
                     )
                 else:
                     self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_length, ch,time_emb_dim=time_embed_dim)
+                        AdaptiveFeatureSelect3(layer_length, ch)
                     )
 
 
@@ -3445,15 +3445,11 @@ class UNetModelSwinPyConv5(nn.Module):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
                 target_size = res_h.shape[2:]
-                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h,timesteps) #  weights = [batchsize,encoder]
+                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h) #  weights = [batchsize,encoder]
                 self.ws[ii].append(weights)
                 afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
                 # # 1、多尺度特征融合
                 multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h)
-                # multi_h =0
-                # for afpf_aligned_feature in afpf_aligned_features:
-                #     multi_h+=afpf_aligned_feature
-                # multi_h += res_h
                 # 1、skip跳越层
                 skip_h = self.skip_connections[ii][jj](multi_h)
                 res_h = skip_h
@@ -3647,110 +3643,7 @@ class AdaptiveFeatureSelect3(nn.Module):
             final_features.append((weighted_feature,i))
 
         return final_features, attn_weights
-class AdaptiveFeatureSelect4(nn.Module):
 
-    def __init__(self, num_encoder_layers, feature_dim,
-                 embedding_dim=64,
-                 reduction_ratio=16,
-                 time_emb_dim=160,
-                 topk_ratio=0.5,
-                 soft_temp=0.2
-
-                 ):
-        super().__init__()
-        self.num_encoder_layers = num_encoder_layers
-        self.feature_dim = feature_dim
-        self.embedding_dim = embedding_dim
-        self.reduction_ratio = reduction_ratio
-        self.time_emb_dim = time_emb_dim
-        self.encoder_key_embedding = nn.Embedding(num_encoder_layers, embedding_dim)
-        self.topk_ratio = topk_ratio
-        self.soft_temp = soft_temp
-
-        self.query_net = nn.Sequential(
-            nn.Conv2d(feature_dim, feature_dim // reduction_ratio, kernel_size=1),  # 降维
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),  # 全局平均池化，获取全局特征表示
-            nn.Flatten(),
-            nn.Linear(feature_dim // reduction_ratio, embedding_dim // 2),
-            nn.ReLU(),
-            nn.Linear(embedding_dim // 2, embedding_dim)
-        )
-
-
-        self.log_temperature = nn.Parameter(torch.tensor(0.0))
-
-
-        self.layer_embedding = nn.Embedding(num_encoder_layers, embedding_dim)
-
-
-        self.fusion_net = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim)
-        )
-        self.emb_layers = nn.Sequential(
-            nn.SiLU(),
-            linear(self.embedding_dim,self.num_encoder_layers * 2 ),
-        )
-
-    def soft_topk_mask(self, scores, k, temperature=0.2):
-        """
-        scores: [B, L]
-        return: [B, L] soft mask in [0,1]
-        """
-        sorted_scores, _ = torch.sort(scores, descending=True, dim=1)
-        kth_score = sorted_scores[:, k - 1:k]  # top-k 阈值
-        mask = torch.sigmoid((scores - kth_score) / temperature)
-        return mask
-    def forward(self, encoder_features,layer_idx,query_feat,timesteps):
-        """
-        encoder_features: 编码器特征二维数组，encoder_features[i][j] = [B, C, H, W]
-        query_feat: 解码器当前层的特征，[B, C, H, W]
-        layer_idx: 当前解码器层索引
-        """
-        batch_size = query_feat.size(0)
-        device = query_feat.device
-
-        t_emb = timestep_embedding(timesteps, self.embedding_dim ) # [B, embedding_dim]
-        t_emb_out = self.emb_layers(t_emb)
-        query_from_content = self.query_net(query_feat)  # [B, embedding_dim]
-
-        query_from_layer = self.layer_embedding(
-            torch.tensor(layer_idx, device=device).clamp(0, self.num_encoder_layers - 1)
-        ).unsqueeze(0).expand(batch_size, -1)  # [B, embedding_dim]
-
-        fused_query = torch.cat([query_from_content, query_from_layer], dim=1)  # [B, embedding_dim * 2 ]
-        query = self.fusion_net(fused_query)  # [B, embedding_dim]
-        # query = query * torch.sigmoid(t_emb)
-        query = query
-        query = query.unsqueeze(1)  # [B, 1, embedding_dim]
-
-
-        encoder_indices = torch.arange(self.num_encoder_layers, device=device)
-        keys = self.encoder_key_embedding(encoder_indices)  # [num_encoder_layers, embedding_dim]
-        keys = keys.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_encoder_layers, embedding_dim]
-        keys = keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
-
-        attn_scores = torch.bmm(query, keys).squeeze(1)  # [B, num_encoder_layers]
-
-        temperature = torch.exp(self.log_temperature)
-        attn_weights = F.softmax(attn_scores / temperature, dim=1)  # [B, num_encoder_layers]
-
-        # L = self.num_encoder_layers
-        # k = max(1, int(L * self.topk_ratio))
-        # soft_mask = self.soft_topk_mask(attn_weights, k, temperature=self.soft_temp)
-        # attn_weights = attn_weights * soft_mask
-        # attn_weights = attn_weights / (attn_weights.sum(dim=1, keepdim=True) + 1e-8)
-
-
-        final_features = []
-        for i, row in enumerate(encoder_features):
-            feature = row[-1] if isinstance(row, (list, tuple)) else row
-            weighted_feature = feature * attn_weights[:, i].view(batch_size, 1, 1, 1)
-            final_features.append((weighted_feature,i))
-
-        return final_features, attn_weights
 class SCAttentionAFPF(nn.Module):
     def __init__(self, in_channels_list, out_channels=256, reduction=8):
         super().__init__()

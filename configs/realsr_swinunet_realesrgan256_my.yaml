@@ -59,12 +59,12 @@ model:
   params:
     image_size: 64
     in_channels: 3
-    model_channels: 160
+    model_channels: 64
     out_channels: ${autoencoder.params.embed_dim}
     attention_resolutions: [64,32,16,8]
     dropout: 0
-    channel_mult: [1, 2,2,4 ]
-    num_res_blocks: [2, 2,2,2 ]
+    channel_mult: [1, 2,]
+    num_res_blocks: [2, 2,2,2]
     conv_resample: True
     dims: 2
     use_fp16: False
@@ -195,10 +195,10 @@ train:
   # optimization settings
   weight_decay: 1e-4               
   ema_rate: 0.999
-  iterations: 10            # total iterations
+  iterations: 1000            # total iterations
   # save logging
-  save_freq: 2
-  log_freq: [2,2,4]         # [training loss, training images, val images]
+  save_freq: 100
+  log_freq: [50,500,4]         # [training loss, training images, val images]
   loss_coef: [1.0, 1.0]         # [mse, lpips]
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging

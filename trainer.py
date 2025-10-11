@@ -1183,7 +1183,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                 losses["loss"] = losses["mse"]
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
-            ws = self.model.ws
+            # ws = self.model.ws
             # if ws:
                 # prior_loss = 0.1 * self.prior_att_loss(ws)
                 # losses['prior'] = prior_loss
@@ -1363,7 +1363,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             if self.current_iters % self.configs.train.save_freq == 0:
                 self.toc = time.time()
                 elaplsed = (self.toc - self.tic)
-                self.prior_att()
+                # self.prior_att()
                 self.logger.info(f"Elapsed time: {elaplsed:.2f}s")
                 self.logger.info("="*100)
 
