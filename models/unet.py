@@ -3395,11 +3395,11 @@ class UNetModelSwinPyConv5(nn.Module):
                 )
                 if i == 0:
                     self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_length,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]),time_emb_dim=time_embed_dim)
+                        AdaptiveFeatureSelect4(layer_chs,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]),time_emb_dim=time_embed_dim)
                     )
                 else:
                     self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_length, ch,time_emb_dim=time_embed_dim)
+                        AdaptiveFeatureSelect4(layer_chs, ch,time_emb_dim=time_embed_dim)
                     )
 
 
@@ -3445,7 +3445,7 @@ class UNetModelSwinPyConv5(nn.Module):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
                 target_size = res_h.shape[2:]
-                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h,timesteps) #  weights = [batchsize,encoder]
+                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h,emb) #  weights = [batchsize,encoder]
                 self.ws[ii].append(weights)
                 afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
                 # # 1、多尺度特征融合
@@ -3649,23 +3649,19 @@ class AdaptiveFeatureSelect3(nn.Module):
         return final_features, attn_weights
 class AdaptiveFeatureSelect4(nn.Module):
 
-    def __init__(self, num_encoder_layers, feature_dim,
+    def __init__(self, encoder_chs, feature_dim,
                  embedding_dim=64,
                  reduction_ratio=16,
                  time_emb_dim=160,
-                 topk_ratio=0.5,
-                 soft_temp=0.2
-
                  ):
         super().__init__()
-        self.num_encoder_layers = num_encoder_layers
+        self.num_encoder_layers =len(encoder_chs)
+        self.encoder_chs = encoder_chs
         self.feature_dim = feature_dim
         self.embedding_dim = embedding_dim
         self.reduction_ratio = reduction_ratio
         self.time_emb_dim = time_emb_dim
-        self.encoder_key_embedding = nn.Embedding(num_encoder_layers, embedding_dim)
-        self.topk_ratio = topk_ratio
-        self.soft_temp = soft_temp
+        self.encoder_key_embedding = nn.Embedding(self.num_encoder_layers, embedding_dim)
 
         self.query_net = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim // reduction_ratio, kernel_size=1),  # 降维
@@ -3681,7 +3677,7 @@ class AdaptiveFeatureSelect4(nn.Module):
         self.log_temperature = nn.Parameter(torch.tensor(0.0))
 
 
-        self.layer_embedding = nn.Embedding(num_encoder_layers, embedding_dim)
+        self.layer_embedding = nn.Embedding(self.num_encoder_layers, embedding_dim)
 
 
         self.fusion_net = nn.Sequential(
@@ -3689,21 +3685,12 @@ class AdaptiveFeatureSelect4(nn.Module):
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )
-        self.emb_layers = nn.Sequential(
-            nn.SiLU(),
-            linear(self.embedding_dim,self.num_encoder_layers * 2 ),
+        self.feature_projection = nn.ModuleList(
+            [nn.Conv2d(chs, self.embedding_dim, 1) for chs in self.encoder_chs]
         )
 
-    def soft_topk_mask(self, scores, k, temperature=0.2):
-        """
-        scores: [B, L]
-        return: [B, L] soft mask in [0,1]
-        """
-        sorted_scores, _ = torch.sort(scores, descending=True, dim=1)
-        kth_score = sorted_scores[:, k - 1:k]  # top-k 阈值
-        mask = torch.sigmoid((scores - kth_score) / temperature)
-        return mask
-    def forward(self, encoder_features,layer_idx,query_feat,timesteps):
+        self.key_fusion_weights = nn.Parameter(torch.tensor(0.5))  # 初始平衡
+    def forward(self, encoder_features,layer_idx,query_feat,t_emb):
         """
         encoder_features: 编码器特征二维数组，encoder_features[i][j] = [B, C, H, W]
         query_feat: 解码器当前层的特征，[B, C, H, W]
@@ -3711,9 +3698,7 @@ class AdaptiveFeatureSelect4(nn.Module):
         """
         batch_size = query_feat.size(0)
         device = query_feat.device
-
-        t_emb = timestep_embedding(timesteps, self.embedding_dim ) # [B, embedding_dim]
-        t_emb_out = self.emb_layers(t_emb)
+        # ========================= query ======================================
         query_from_content = self.query_net(query_feat)  # [B, embedding_dim]
 
         query_from_layer = self.layer_embedding(
@@ -3722,28 +3707,38 @@ class AdaptiveFeatureSelect4(nn.Module):
 
         fused_query = torch.cat([query_from_content, query_from_layer], dim=1)  # [B, embedding_dim * 2 ]
         query = self.fusion_net(fused_query)  # [B, embedding_dim]
-        # query = query * torch.sigmoid(t_emb)
-        query = query
         query = query.unsqueeze(1)  # [B, 1, embedding_dim]
 
-
+        # ========================= key ======================================
         encoder_indices = torch.arange(self.num_encoder_layers, device=device)
-        keys = self.encoder_key_embedding(encoder_indices)  # [num_encoder_layers, embedding_dim]
-        keys = keys.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_encoder_layers, embedding_dim]
-        keys = keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
+        index_keys = self.encoder_key_embedding(encoder_indices)  # [num_encoder_layers, embedding_dim]
+        index_keys = index_keys.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_encoder_layers, embedding_dim]
+        index_keys = index_keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
 
+        target_size = query_feat.shape[-2:]
+        encoder_features_proj = []
+        for i, feat in enumerate(encoder_features):
+            feature = feat[-1] if isinstance(feat, (list, tuple)) else feat
+
+            # 如果特征尺寸不匹配，进行上采样
+            if feature.shape[-2:] != target_size:
+                aligned_feat = F.interpolate(
+                    feature, size=target_size, mode='bilinear', align_corners=False
+                )
+            else:
+                aligned_feat = feature
+            proj_feat = F.adaptive_avg_pool2d(self.feature_projection[i](aligned_feat),1).squeeze(-1).squeeze(-1) # [B, embedding_dim]
+            encoder_features_proj.append(proj_feat)
+        content_keys = torch.stack(encoder_features_proj, dim=1)  # [B,num_encoder_layers,  embedding_dim]
+        content_keys = content_keys.transpose(1, 2)  # [B,  embedding_dim, num_encoder_layers]
+        fusion_weights = torch.sigmoid(self.key_fusion_weights).view(1, 1, 1)  # 可学习的融合权重
+        keys = fusion_weights * content_keys + (1 - fusion_weights) * index_keys
+
+        # ========================= attention ======================================
         attn_scores = torch.bmm(query, keys).squeeze(1)  # [B, num_encoder_layers]
 
         temperature = torch.exp(self.log_temperature)
         attn_weights = F.softmax(attn_scores / temperature, dim=1)  # [B, num_encoder_layers]
-
-        # L = self.num_encoder_layers
-        # k = max(1, int(L * self.topk_ratio))
-        # soft_mask = self.soft_topk_mask(attn_weights, k, temperature=self.soft_temp)
-        # attn_weights = attn_weights * soft_mask
-        # attn_weights = attn_weights / (attn_weights.sum(dim=1, keepdim=True) + 1e-8)
-
-
         final_features = []
         for i, row in enumerate(encoder_features):
             feature = row[-1] if isinstance(row, (list, tuple)) else row
