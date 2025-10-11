@@ -53,7 +53,7 @@ autoencoder:
 #    lq_size: 64
 
 model:
-  target: models.unet.UNetModelSwinPyConv4
+  target: models.unet.UNetModelSwinPyConv5
   #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
   ckpt_path: ~
   params:

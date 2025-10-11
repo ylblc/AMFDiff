@@ -1184,9 +1184,10 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
             ws = self.model.ws
-            prior_loss = 0.1 * self.prior_att_loss(ws)
-            losses['prior'] = prior_loss
-            losses['loss'] += prior_loss
+            # if ws:
+                # prior_loss = 0.1 * self.prior_att_loss(ws)
+                # losses['prior'] = prior_loss
+                # losses['loss'] += prior_loss
             loss = losses['loss'].mean() / num_grad_accumulate
         if self.amp_scaler is None:
             loss.backward()
@@ -1196,14 +1197,15 @@ class TrainerDifIRLPIPS(TrainerDifIR):
 
     def prior_att(self):
         ws = self.model.ws
-        s=""
-        for i, row in enumerate(ws):
-            row_s=""
-            for j, col in enumerate(row):
-                arr1 = [round(x,4) for x in col.mean(dim=0).tolist()]
-                row_s+=f'Decoder({i},{j})={arr1}  '
-            s+=row_s+"\n"
-        self.logger.info(s)
+        if ws:
+            s=""
+            for i, row in enumerate(ws):
+                row_s=""
+                for j, col in enumerate(row):
+                    arr1 = [round(x,4) for x in col.mean(dim=0).tolist()]
+                    row_s+=f'Decoder({i},{j})={arr1}  '
+                s+=row_s+"\n"
+            self.logger.info(s)
     def prior_att_loss(self,ws):
         prior_loss = 0
         consistency_loss = 0
@@ -1337,11 +1339,11 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                         self.current_iters,
                         self.configs.train.iterations)
                 for jj, current_record in enumerate(record_steps):
-                    log_str += 't({:d}):{:.5e}/{:.5e}/{:.5e}, '.format(
+                    log_str += 't({:d}):{:.5e}/{:.5e}, '.format(
                             current_record,
                             self.loss_mean['mse'][jj].item(),
                             self.loss_mean['lpips'][jj].item(),
-                            self.loss_mean['prior'][jj].item(),
+
                             )
                 log_str += 'lr:{:.2e}'.format(self.optimizer.param_groups[0]['lr'])
                 self.logger.info(log_str)
