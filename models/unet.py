@@ -1182,7 +1182,7 @@ class UNetModelConv(nn.Module):
         out = self.out(h)
         return out
 
-from models.pyconv import PyConv3AdaptiveSEResDP, PyConv3AdaptiveSEResDP0
+from models.pyconv import PyConv3AdaptiveSEResDP, PyConv3AdaptiveSEResDP0, PyConv3AdaptiveSEResDP2
 
 
 class UNetModelSwinPyConv(nn.Module):
@@ -3318,9 +3318,9 @@ class UNetModelSwinPyConv5(nn.Module):
                         use_scale_shift_norm=use_scale_shift_norm,
                         )
                 ]
-                self.skip_connections[index].append(
-                    PyConv3AdaptiveSEResDP(ich, ich, level + 1, len(channel_mult))
-                )
+                # self.skip_connections[index].append(
+                #     PyConv3AdaptiveSEResDP2(ich, ich)
+                # )
                 ch = int(model_channels * mult)
 
                 if ds in attention_resolutions and i==0:
@@ -3379,7 +3379,7 @@ class UNetModelSwinPyConv5(nn.Module):
             for i in range(num_res_blocks[level] + 1):
                 ich = input_block_chans3[level].pop()  # 编码器层的输出通道数
                 self.aligns[index].append(
-                    FeatureAlign(layer_chs, ich)
+                    FeatureAlign2(layer_chs, ich)
                 )
         for level, mult in list(enumerate(channel_mult))[::-1]:
             self.afpfs.append(nn.ModuleList([]))
@@ -3390,16 +3390,16 @@ class UNetModelSwinPyConv5(nn.Module):
             for i in range(num_res_blocks[level] + 1):
                 ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
 
-                self.afpfs[index].append(
-                        SCAttentionAFPF2(layer_chs, ich)
-                )
+                # self.afpfs[index].append(
+                #         SCAttentionAFPF3(layer_chs, ich)
+                # )
                 if i == 0:
                     self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_chs,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]),time_emb_dim=time_embed_dim)
+                        AdaptiveFeatureSelect4(layer_chs,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]))
                     )
                 else:
                     self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_chs, ch,time_emb_dim=time_embed_dim)
+                        AdaptiveFeatureSelect4(layer_chs, ch)
                     )
 
 
@@ -3445,18 +3445,18 @@ class UNetModelSwinPyConv5(nn.Module):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
                 target_size = res_h.shape[2:]
-                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h,emb) #  weights = [batchsize,encoder]
+                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h) #  weights = [batchsize,encoder]
                 self.ws[ii].append(weights)
                 afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
                 # # 1、多尺度特征融合
-                multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h)
-                # multi_h =0
-                # for afpf_aligned_feature in afpf_aligned_features:
-                #     multi_h+=afpf_aligned_feature
-                # multi_h += res_h
+                # multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h)
+                multi_h =0
+                for afpf_aligned_feature in afpf_aligned_features:
+                    multi_h+=afpf_aligned_feature
+                multi_h += res_h
                 # 1、skip跳越层
-                skip_h = self.skip_connections[ii][jj](multi_h)
-                res_h = skip_h
+                # skip_h = self.skip_connections[ii][jj](multi_h)
+                res_h = multi_h
                 h = th.cat([h, res_h], dim=1)
                 h = module(h, emb)
         h = h.type(x.dtype)
@@ -3653,6 +3653,7 @@ class AdaptiveFeatureSelect4(nn.Module):
                  embedding_dim=64,
                  reduction_ratio=16,
                  time_emb_dim=160,
+                 k_list=None
                  ):
         super().__init__()
         self.num_encoder_layers =len(encoder_chs)
@@ -3662,7 +3663,7 @@ class AdaptiveFeatureSelect4(nn.Module):
         self.reduction_ratio = reduction_ratio
         self.time_emb_dim = time_emb_dim
         self.encoder_key_embedding = nn.Embedding(self.num_encoder_layers, embedding_dim)
-
+        self.k_list = [x+1 for x in range(self.num_encoder_layers)] if k_list is None else k_list
         self.query_net = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim // reduction_ratio, kernel_size=1),  # 降维
             nn.ReLU(inplace=True),
@@ -3690,7 +3691,9 @@ class AdaptiveFeatureSelect4(nn.Module):
         )
 
         self.key_fusion_weights = nn.Parameter(torch.tensor(0.5))  # 初始平衡
-    def forward(self, encoder_features,layer_idx,query_feat,t_emb):
+        k_len = len(self.k_list)
+        self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,))/k_len)
+    def forward(self, encoder_features,layer_idx,query_feat):
         """
         encoder_features: 编码器特征二维数组，encoder_features[i][j] = [B, C, H, W]
         query_feat: 解码器当前层的特征，[B, C, H, W]
@@ -3707,6 +3710,8 @@ class AdaptiveFeatureSelect4(nn.Module):
 
         fused_query = torch.cat([query_from_content, query_from_layer], dim=1)  # [B, embedding_dim * 2 ]
         query = self.fusion_net(fused_query)  # [B, embedding_dim]
+        # 归一化
+        query = F.layer_norm(query, normalized_shape=(self.embedding_dim,))  # 添加LayerNorm
         query = query.unsqueeze(1)  # [B, 1, embedding_dim]
 
         # ========================= key ======================================
@@ -3715,36 +3720,45 @@ class AdaptiveFeatureSelect4(nn.Module):
         index_keys = index_keys.unsqueeze(0).expand(batch_size, -1, -1)  # [B, num_encoder_layers, embedding_dim]
         index_keys = index_keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
 
-        target_size = query_feat.shape[-2:]
+
         encoder_features_proj = []
         for i, feat in enumerate(encoder_features):
             feature = feat[-1] if isinstance(feat, (list, tuple)) else feat
-
-            # 如果特征尺寸不匹配，进行上采样
-            if feature.shape[-2:] != target_size:
-                aligned_feat = F.interpolate(
-                    feature, size=target_size, mode='bilinear', align_corners=False
-                )
-            else:
-                aligned_feat = feature
-            proj_feat = F.adaptive_avg_pool2d(self.feature_projection[i](aligned_feat),1).squeeze(-1).squeeze(-1) # [B, embedding_dim]
+            proj_feat = F.adaptive_avg_pool2d(self.feature_projection[i](feature),1).squeeze(-1).squeeze(-1) # [B, embedding_dim]
             encoder_features_proj.append(proj_feat)
         content_keys = torch.stack(encoder_features_proj, dim=1)  # [B,num_encoder_layers,  embedding_dim]
         content_keys = content_keys.transpose(1, 2)  # [B,  embedding_dim, num_encoder_layers]
         fusion_weights = torch.sigmoid(self.key_fusion_weights).view(1, 1, 1)  # 可学习的融合权重
         keys = fusion_weights * content_keys + (1 - fusion_weights) * index_keys
-
+        # 归一化
+        keys = keys.transpose(1, 2)  # [B, num_encoder_layers, embedding_dim]
+        keys = F.layer_norm(keys, normalized_shape=(self.embedding_dim,))  # 对最后一个维度归一化
+        keys = keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
         # ========================= attention ======================================
         attn_scores = torch.bmm(query, keys).squeeze(1)  # [B, num_encoder_layers]
-
         temperature = torch.exp(self.log_temperature)
-        attn_weights = F.softmax(attn_scores / temperature, dim=1)  # [B, num_encoder_layers]
+        # attn_scores = attn_scores / temperature
         final_features = []
+        # 1、topk稀疏化权重计算 计算不同K值的注意力
+        topk_att_list = []
+        attn_weights = 0
+        for idx,k in enumerate(self.k_list):
+            index = torch.topk(attn_scores, k=k, dim=-1, largest=True)[1]
+            mask = torch.zeros_like(attn_scores, device=attn_scores.device, requires_grad=False)
+            mask.scatter_(1, index, 1.)
+            attn = torch.where(mask > 0, attn_scores, torch.full_like(attn_scores, float('-inf')))
+            attn = F.softmax(attn / temperature , dim=-1)  # [B, num_encoder_layers]
+            topk_att_list.append(attn)
+            attn_weights += attn * self.sparse_weights[idx]
+        # 归一化（0 除外）
+        # attn_weights /= len(topk_att_list)
+
+        # 2、原注意力权重计算
+        # attn_weights = F.softmax(attn_scores / temperature, dim=1)  # [B, num_encoder_layers]
         for i, row in enumerate(encoder_features):
             feature = row[-1] if isinstance(row, (list, tuple)) else row
             weighted_feature = feature * attn_weights[:, i].view(batch_size, 1, 1, 1)
-            final_features.append((weighted_feature,i))
-
+            final_features.append((weighted_feature, i))
         return final_features, attn_weights
 class SCAttentionAFPF(nn.Module):
     def __init__(self, in_channels_list, out_channels=256, reduction=8):
@@ -3833,6 +3847,59 @@ class SCAttentionAFPF2(nn.Module):
 
         return self.res_alpha * fused + base_feature
 
+class SCAttentionAFPF3(nn.Module):
+    def __init__(self, in_channels_list, out_channels=256, reduction=8,time_emb_dim=160):
+        super().__init__()
+        self.num_levels = len(in_channels_list)
+        self.time_emb_dim = time_emb_dim
+        # 一、空间注意力
+        self.spatial_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(2, 1, 7, padding=3),
+                nn.Sigmoid()
+            ) for _ in range(self.num_levels)
+        ])
+
+        # 二、多尺度空间注意力
+        # self.multi_scale_spatial = nn.ModuleList([
+        #     nn.ModuleDict({
+        #         'conv3': nn.Conv2d(2, 1, 3, padding=1),
+        #         'conv5': nn.Conv2d(2, 1, 5, padding=2),
+        #         'conv7': nn.Conv2d(2, 1, 7, padding=3),
+        #     }) for _ in range(self.num_levels)
+        # ])
+        # 通道注意力
+        self.channel_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(out_channels, out_channels // reduction, 1),
+                nn.ReLU(),
+                nn.Conv2d(out_channels // reduction, out_channels, 1),
+                nn.Sigmoid()
+            ) for _ in range(self.num_levels)
+        ])
+        self.res_alpha = nn.Parameter(torch.tensor(0.5))
+
+
+    def forward(self,aligned_feats, base_feature):
+        fused = th.zeros_like(base_feature)
+        for i,  aligned in enumerate(aligned_feats):
+            # 空间注意力
+            avg_out = th.mean(aligned, dim=1, keepdim=True)
+            max_out, _ = th.max(aligned, dim=1, keepdim=True)
+            spatial_input = th.cat([avg_out, max_out],dim=1)
+            # scale3 = self.multi_scale_spatial[i]['conv3'](spatial_input)
+            # scale5 = self.multi_scale_spatial[i]['conv5'](spatial_input)
+            # scale7 = self.multi_scale_spatial[i]['conv7'](spatial_input)
+            # spatial_attn = scale3 + scale5 + scale7
+            spatial_input = F.layer_norm(spatial_input, spatial_input.shape[1:])
+            spatial_attn = self.spatial_attention[i](spatial_input)
+            # 通道注意力
+            channel_attn = self.channel_attention[i](aligned)
+            attended = aligned *  ( spatial_attn + channel_attn)
+            fused += attended
+
+        return self.res_alpha * fused + base_feature
 
 
 class FeatureAlign(nn.Module):
@@ -3864,40 +3931,61 @@ class FeatureAlign(nn.Module):
                     )
             aligned_features.append(channel_aligned)
         return aligned_features
+class FeatureAlign2(nn.Module):
 
-class LightGateFusion(nn.Module):
-    def __init__(self, channels, reduction=8):
+    def __init__(self, channels_list, target_channel=256):
         super().__init__()
-        self.channels = channels
+        self.target_channel = target_channel
 
-        # 极简门控网络
-        self.gate_net = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(2 * channels, channels // reduction, 1),
-            nn.ReLU(),
-            nn.Conv2d(channels // reduction, 2, 1),
-            nn.Sigmoid()
-        )
 
-        # 残差缩放因子
-        self.residual_scale = nn.Parameter(th.tensor(1.0))
+        self.aligners = nn.ModuleDict()
+        for i, channels in enumerate(channels_list):
 
-    def forward(self, skip_feat, fused_feat):
-        # 计算门控权重
-        combined = th.cat([skip_feat, fused_feat], dim=1)
-        gate_weights = self.gate_net(combined)
-        gate_skip, gate_fused = gate_weights.chunk(2, dim=1)
+            channel_aligner = nn.Conv2d(channels, target_channel, 1)
+            self.aligners[f'layer_{i}'] = channel_aligner
 
-        # 应用门控
-        gate_skip = gate_skip.view(-1, 1, 1, 1)
-        gate_fused = gate_fused.view(-1, 1, 1, 1)
+        self.scale_weights = nn.Parameter(torch.ones(len(channels_list)))
+    def forward(self, features, target_size):
 
-        combined_resH = skip_feat * gate_skip + fused_feat * gate_fused
+        aligned_features = []
 
-        # 残差连接
-        final_feat = skip_feat + self.residual_scale * combined_resH
+        for feat,idx in features:
 
-        return final_feat
+            channel_aligned = self.aligners[f'layer_{idx}'](feat)
+            spatial_aligned = self._pyramid_align(channel_aligned, target_size, idx)
+            aligned_features.append(spatial_aligned)
+        return aligned_features
+
+    def _pyramid_align(self, feat, target_size, layer_idx):
+        current_size = feat.shape[2:]
+
+        if current_size == target_size:
+            return feat
+
+        scale_weight = torch.sigmoid(self.scale_weights[layer_idx])
+
+        # 根据尺度差异选择最佳对齐策略
+        size_ratio = max(target_size[0] / current_size[0], target_size[1] / current_size[1])
+
+        if size_ratio < 0.5:  # 大幅下采样
+            # 使用组合下采样，用scale_weight调整混合比例
+            avg_pooled = F.adaptive_avg_pool2d(feat, target_size)
+            max_pooled = F.adaptive_max_pool2d(feat, target_size)
+            aligned = scale_weight * avg_pooled + (1 - scale_weight) * max_pooled
+
+        elif size_ratio > 2.0:  # 大幅上采样
+            # 使用不同上采样方法的组合
+            bilinear = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=False)
+            nearest = F.interpolate(feat, size=target_size, mode='nearest')
+            aligned = scale_weight * bilinear + (1 - scale_weight) * nearest
+
+        else:  # 适度缩放
+            if current_size[0] > target_size[0]:
+                aligned = F.adaptive_avg_pool2d(feat, target_size)
+            else:
+                aligned = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=False)
+
+        return aligned
 class AFPF(nn.Module):
     def __init__(self, in_channels_list, out_channels=256,enh_reduction=4,w_reduction=8):
 
