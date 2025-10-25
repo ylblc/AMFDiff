@@ -1202,7 +1202,10 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             for i, row in enumerate(ws):
                 row_s=""
                 for j, col in enumerate(row):
-                    arr1 = [round(x,4) for x in col.mean(dim=0).tolist()]
+                    if len(col.shape) != 1:
+                        arr1 = [round(x,4) for x in col.mean(dim=0).tolist()]
+                    else:
+                        arr1 = [round(x,4) for x in col.tolist()]
                     row_s+=f'Decoder({i},{j})={arr1}  '
                 s+=row_s+"\n"
             self.logger.info(s)

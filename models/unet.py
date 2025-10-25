@@ -3318,9 +3318,9 @@ class UNetModelSwinPyConv5(nn.Module):
                         use_scale_shift_norm=use_scale_shift_norm,
                         )
                 ]
-                # self.skip_connections[index].append(
-                #     PyConv3AdaptiveSEResDP2(ich, ich)
-                # )
+                self.skip_connections[index].append(
+                    PyConv3AdaptiveSEResDP2(ich, ich)
+                )
                 ch = int(model_channels * mult)
 
                 if ds in attention_resolutions and i==0:
@@ -3373,26 +3373,28 @@ class UNetModelSwinPyConv5(nn.Module):
         for level, mult in list(enumerate(channel_mult))[::-1]:
             index = len(channel_mult) - level - 1
             layer_length = len(channel_mult)
-            self.layer_selects.append(nn.ModuleList())
-            ch = int(model_channels * mult)
             self.aligns.append(nn.ModuleList([]))
             for i in range(num_res_blocks[level] + 1):
-                ich = input_block_chans3[level].pop()  # 编码器层的输出通道数
+                ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
                 self.aligns[index].append(
                     FeatureAlign2(layer_chs, ich)
                 )
         for level, mult in list(enumerate(channel_mult))[::-1]:
             self.afpfs.append(nn.ModuleList([]))
             index = len(channel_mult) - level - 1
+            for i in range(num_res_blocks[level] + 1):
+                ich = input_block_chans3[level].pop()  # 编码器层的输出通道数
+                self.afpfs[index].append(
+                        SCAttentionAFPF3(layer_chs, ich,time_emb_dim=time_embed_dim)
+                )
+        for level, mult in list(enumerate(channel_mult))[::-1]:
+
+            index = len(channel_mult) - level - 1
 
             self.layer_selects.append(nn.ModuleList())
             ch = int(model_channels * mult)
             for i in range(num_res_blocks[level] + 1):
-                ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
-
-                # self.afpfs[index].append(
-                #         SCAttentionAFPF3(layer_chs, ich)
-                # )
+                ich = input_block_chans4[level].pop()  # 编码器层的输出通道数
                 if i == 0:
                     self.layer_selects[index].append(
                         AdaptiveFeatureSelect4(layer_chs,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]))
@@ -3446,17 +3448,18 @@ class UNetModelSwinPyConv5(nn.Module):
                 res_h = hs_row[curr_hs_j]
                 target_size = res_h.shape[2:]
                 afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h) #  weights = [batchsize,encoder]
+                # afpf_features = [(hs[i][-1],i) for i in range(3)]
                 self.ws[ii].append(weights)
                 afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
                 # # 1、多尺度特征融合
-                # multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h)
-                multi_h =0
-                for afpf_aligned_feature in afpf_aligned_features:
-                    multi_h+=afpf_aligned_feature
-                multi_h += res_h
+                multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h,emb)
+                # multi_h =0
+                # for afpf_aligned_feature in afpf_aligned_features:
+                #     multi_h+=afpf_aligned_feature
+                # multi_h += res_h
                 # 1、skip跳越层
-                # skip_h = self.skip_connections[ii][jj](multi_h)
-                res_h = multi_h
+                skip_h = self.skip_connections[ii][jj](res_h)
+                res_h = multi_h + skip_h
                 h = th.cat([h, res_h], dim=1)
                 h = module(h, emb)
         h = h.type(x.dtype)
@@ -3653,7 +3656,9 @@ class AdaptiveFeatureSelect4(nn.Module):
                  embedding_dim=64,
                  reduction_ratio=16,
                  time_emb_dim=160,
-                 k_list=None
+                 k_list=None,
+                 norm = False,
+                 topk_sparse=True,
                  ):
         super().__init__()
         self.num_encoder_layers =len(encoder_chs)
@@ -3662,15 +3667,17 @@ class AdaptiveFeatureSelect4(nn.Module):
         self.embedding_dim = embedding_dim
         self.reduction_ratio = reduction_ratio
         self.time_emb_dim = time_emb_dim
+        self.topk_sparse = topk_sparse
         self.encoder_key_embedding = nn.Embedding(self.num_encoder_layers, embedding_dim)
         self.k_list = [x+1 for x in range(self.num_encoder_layers)] if k_list is None else k_list
+        self.norm = norm
         self.query_net = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim // reduction_ratio, kernel_size=1),  # 降维
-            nn.ReLU(inplace=True),
+            nn.PReLU(),
             nn.AdaptiveAvgPool2d(1),  # 全局平均池化，获取全局特征表示
             nn.Flatten(),
             nn.Linear(feature_dim // reduction_ratio, embedding_dim // 2),
-            nn.ReLU(),
+            nn.PReLU(),
             nn.Linear(embedding_dim // 2, embedding_dim)
         )
 
@@ -3681,18 +3688,19 @@ class AdaptiveFeatureSelect4(nn.Module):
         self.layer_embedding = nn.Embedding(self.num_encoder_layers, embedding_dim)
 
 
-        self.fusion_net = nn.Sequential(
-            nn.Linear(embedding_dim * 2, embedding_dim),
-            nn.ReLU(),
-            nn.Linear(embedding_dim, embedding_dim)
-        )
+        # self.fusion_net = nn.Sequential(
+        #     nn.Linear(embedding_dim * 2, embedding_dim),
+        #     nn.PReLU(),
+        #     nn.Linear(embedding_dim, embedding_dim)
+        # )
         self.feature_projection = nn.ModuleList(
             [nn.Conv2d(chs, self.embedding_dim, 1) for chs in self.encoder_chs]
         )
 
         self.key_fusion_weights = nn.Parameter(torch.tensor(0.5))  # 初始平衡
         k_len = len(self.k_list)
-        self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,))/k_len)
+        # self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,))/k_len,requires_grad=True)
+        self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,)), requires_grad=True)
     def forward(self, encoder_features,layer_idx,query_feat):
         """
         encoder_features: 编码器特征二维数组，encoder_features[i][j] = [B, C, H, W]
@@ -3707,11 +3715,14 @@ class AdaptiveFeatureSelect4(nn.Module):
         query_from_layer = self.layer_embedding(
             torch.tensor(layer_idx, device=device).clamp(0, self.num_encoder_layers - 1)
         ).unsqueeze(0).expand(batch_size, -1)  # [B, embedding_dim]
-
-        fused_query = torch.cat([query_from_content, query_from_layer], dim=1)  # [B, embedding_dim * 2 ]
-        query = self.fusion_net(fused_query)  # [B, embedding_dim]
+        # 方式一: pnsr更高
+        # fused_query = torch.cat([query_from_content, query_from_layer], dim=1)  # [B, embedding_dim * 2 ]
+        # query = self.fusion_net(fused_query)  # [B, embedding_dim]
+        # 方式二: lpips更低
+        query = query_from_layer + query_from_content
         # 归一化
-        query = F.layer_norm(query, normalized_shape=(self.embedding_dim,))  # 添加LayerNorm
+        if self.norm:
+            query = F.layer_norm(query, normalized_shape=(self.embedding_dim,))  # 添加LayerNorm
         query = query.unsqueeze(1)  # [B, 1, embedding_dim]
 
         # ========================= key ======================================
@@ -3721,45 +3732,60 @@ class AdaptiveFeatureSelect4(nn.Module):
         index_keys = index_keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
 
 
+        # 编码器内容特征提取
         encoder_features_proj = []
         for i, feat in enumerate(encoder_features):
             feature = feat[-1] if isinstance(feat, (list, tuple)) else feat
-            proj_feat = F.adaptive_avg_pool2d(self.feature_projection[i](feature),1).squeeze(-1).squeeze(-1) # [B, embedding_dim]
-            encoder_features_proj.append(proj_feat)
+            proj_feat = self.feature_projection[i](feature)
+            proj_feat_avg = F.adaptive_avg_pool2d(proj_feat,1).squeeze(-1).squeeze(-1) # [B, embedding_dim]
+            proj_feat_avg_max = F.adaptive_max_pool2d(proj_feat,1).squeeze(-1).squeeze(-1) # [B, embedding_dim]
+            proj_feat_fusion = proj_feat_avg + proj_feat_avg_max
+            encoder_features_proj.append(proj_feat_fusion)
         content_keys = torch.stack(encoder_features_proj, dim=1)  # [B,num_encoder_layers,  embedding_dim]
         content_keys = content_keys.transpose(1, 2)  # [B,  embedding_dim, num_encoder_layers]
         fusion_weights = torch.sigmoid(self.key_fusion_weights).view(1, 1, 1)  # 可学习的融合权重
         keys = fusion_weights * content_keys + (1 - fusion_weights) * index_keys
         # 归一化
-        keys = keys.transpose(1, 2)  # [B, num_encoder_layers, embedding_dim]
-        keys = F.layer_norm(keys, normalized_shape=(self.embedding_dim,))  # 对最后一个维度归一化
-        keys = keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
+        if self.norm:
+            keys = keys.transpose(1, 2)  # [B, num_encoder_layers, embedding_dim]
+            keys = F.layer_norm(keys, normalized_shape=(self.embedding_dim,))  # 对最后一个维度归一化
+            keys = keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
         # ========================= attention ======================================
         attn_scores = torch.bmm(query, keys).squeeze(1)  # [B, num_encoder_layers]
         temperature = torch.exp(self.log_temperature)
-        # attn_scores = attn_scores / temperature
+        attn_scores = attn_scores / temperature
         final_features = []
-        # 1、topk稀疏化权重计算 计算不同K值的注意力
-        topk_att_list = []
-        attn_weights = 0
-        for idx,k in enumerate(self.k_list):
-            index = torch.topk(attn_scores, k=k, dim=-1, largest=True)[1]
-            mask = torch.zeros_like(attn_scores, device=attn_scores.device, requires_grad=False)
-            mask.scatter_(1, index, 1.)
-            attn = torch.where(mask > 0, attn_scores, torch.full_like(attn_scores, float('-inf')))
-            attn = F.softmax(attn / temperature , dim=-1)  # [B, num_encoder_layers]
-            topk_att_list.append(attn)
-            attn_weights += attn * self.sparse_weights[idx]
-        # 归一化（0 除外）
-        # attn_weights /= len(topk_att_list)
 
-        # 2、原注意力权重计算
-        # attn_weights = F.softmax(attn_scores / temperature, dim=1)  # [B, num_encoder_layers]
+        # 1、topk稀疏化权重计算 计算不同K值的注意力
+        if self.topk_sparse:
+            selection_probs = F.gumbel_softmax(attn_scores)
+            topk_att_list = []
+            attn_weights = 0
+            for idx,k in enumerate(self.k_list):
+                index = torch.topk(attn_scores, k=k, dim=-1, largest=True)[1]
+                mask = torch.zeros_like(attn_scores, device=attn_scores.device, requires_grad=False)
+                mask.scatter_(1, index, 1.)
+                # 方式一（硬选择，1/0）：
+                attn = (mask - selection_probs).detach() + selection_probs
+                topk_att_list.append(attn)
+                attn_weights += attn * self.sparse_weights[idx]
+
+                # 方式二（类硬选择，float/0）：
+                # attn = torch.where(mask > 0, attn_scores, torch.full_like(attn_scores, float('-inf')))
+                # attn = F.softmax(attn , dim=-1)  # [B, num_encoder_layers]
+                # topk_att_list.append(attn)
+                # attn_weights += attn * self.sparse_weights[idx]
+
+            # 归一化（0 除外）
+            # attn_weights /= len(topk_att_list)
+        else:
+            # 2、原注意力权重计算 软选择
+            attn_weights = F.softmax(attn_scores, dim=1)  # [B, num_encoder_layers]
         for i, row in enumerate(encoder_features):
             feature = row[-1] if isinstance(row, (list, tuple)) else row
             weighted_feature = feature * attn_weights[:, i].view(batch_size, 1, 1, 1)
             final_features.append((weighted_feature, i))
-        return final_features, attn_weights
+        return final_features, attn_scores
 class SCAttentionAFPF(nn.Module):
     def __init__(self, in_channels_list, out_channels=256, reduction=8):
         super().__init__()
@@ -3852,15 +3878,8 @@ class SCAttentionAFPF3(nn.Module):
         super().__init__()
         self.num_levels = len(in_channels_list)
         self.time_emb_dim = time_emb_dim
-        # 一、空间注意力
-        self.spatial_attention = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(2, 1, 7, padding=3),
-                nn.Sigmoid()
-            ) for _ in range(self.num_levels)
-        ])
 
-        # 二、多尺度空间注意力
+        # 第一种
         # self.multi_scale_spatial = nn.ModuleList([
         #     nn.ModuleDict({
         #         'conv3': nn.Conv2d(2, 1, 3, padding=1),
@@ -3868,37 +3887,62 @@ class SCAttentionAFPF3(nn.Module):
         #         'conv7': nn.Conv2d(2, 1, 7, padding=3),
         #     }) for _ in range(self.num_levels)
         # ])
+
+        # 第二种
+        self.multi_scale_spatial = nn.ModuleList([
+            nn.ModuleDict({
+                'conv3': nn.Conv2d(1, 1, 3, padding=1),
+                'conv5': nn.Conv2d(1, 1, 5, padding=2),
+                'conv7': nn.Conv2d(1, 1, 7, padding=3),
+            }) for _ in range(1)
+        ])
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
         # 通道注意力
         self.channel_attention = nn.ModuleList([
             nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
                 nn.Conv2d(out_channels, out_channels // reduction, 1),
                 nn.ReLU(),
                 nn.Conv2d(out_channels // reduction, out_channels, 1),
-                nn.Sigmoid()
-            ) for _ in range(self.num_levels)
+
+            ) for _ in range(1)
         ])
         self.res_alpha = nn.Parameter(torch.tensor(0.5))
+        self.scale_weights = nn.Parameter(torch.ones(size=(3,)))
 
+        # self.fusion_gate = nn.Sequential(
+        #     nn.Conv2d(out_channels * 2, out_channels, 1),
+        #     nn.Sigmoid()
+        # )
 
-    def forward(self,aligned_feats, base_feature):
+    def forward(self,aligned_feats, base_feature,time_emb=None):
         fused = th.zeros_like(base_feature)
         for i,  aligned in enumerate(aligned_feats):
             # 空间注意力
             avg_out = th.mean(aligned, dim=1, keepdim=True)
             max_out, _ = th.max(aligned, dim=1, keepdim=True)
-            spatial_input = th.cat([avg_out, max_out],dim=1)
-            # scale3 = self.multi_scale_spatial[i]['conv3'](spatial_input)
-            # scale5 = self.multi_scale_spatial[i]['conv5'](spatial_input)
-            # scale7 = self.multi_scale_spatial[i]['conv7'](spatial_input)
-            # spatial_attn = scale3 + scale5 + scale7
+            # 第一种
+            spatial_input = (avg_out + max_out) / 2
+            # 第二种
+            # spatial_input = th.cat([avg_out, max_out],dim=1)
             spatial_input = F.layer_norm(spatial_input, spatial_input.shape[1:])
-            spatial_attn = self.spatial_attention[i](spatial_input)
-            # 通道注意力
-            channel_attn = self.channel_attention[i](aligned)
-            attended = aligned *  ( spatial_attn + channel_attn)
-            fused += attended
+            scale3 = self.multi_scale_spatial[0]['conv3'](spatial_input)
+            scale5 = self.multi_scale_spatial[0]['conv5'](spatial_input)
+            scale7 = self.multi_scale_spatial[0]['conv7'](spatial_input)
+            spatial_attn = torch.sigmoid(self.scale_weights[0] *  scale3 + self.scale_weights[1] * scale5 + self.scale_weights[2] *scale7)
 
+            # 通道注意力
+            ca_avg = self.avg_pool(aligned)
+            ca_max = self.max_pool(aligned)
+            avg_channel_attn = self.channel_attention[0](ca_avg)
+            max_channel_attn = self.channel_attention[0](ca_max)
+            channel_attn =  avg_channel_attn + max_channel_attn
+            # channel_attn = torch.sigmoid( avg_channel_attn + max_channel_attn)
+            spatial_attended = spatial_attn * aligned
+            channel_attended = channel_attn * aligned
+            # gate = self.fusion_gate(torch.cat([spatial_attended, channel_attended], dim=1))
+            attended =  spatial_attended + channel_attended
+            fused = fused + attended
         return self.res_alpha * fused + base_feature
 
 
