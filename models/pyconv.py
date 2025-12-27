@@ -117,53 +117,8 @@ class PyConv3(nn.Module):
     def forward(self, x):
         return torch.cat((self.conv2_1(x), self.conv2_2(x), self.conv2_3(x)), dim=1)
 
+
 class EfficientPyConv3(nn.Module):
-    def __init__(self, inplans, planes, pyconv_kernels=[3, 5, 7], stride=1):
-        super().__init__()
-
-        # 使用深度可分离卷积减少计算量
-        self.conv2_1 = nn.Sequential(
-            nn.Conv2d(inplans, inplans, kernel_size=pyconv_kernels[0],
-                      padding=pyconv_kernels[0] // 2, stride=stride, groups=inplans),
-            nn.Conv2d(inplans, planes // 2, kernel_size=1)
-        )
-
-        # 分解5x5卷积为两个3x3卷积
-        self.conv2_2 = nn.Sequential(
-            nn.Conv2d(inplans, inplans, kernel_size=3, padding=1, stride=stride, groups=inplans),
-            nn.Conv2d(inplans, inplans, kernel_size=3, padding=1, groups=inplans),
-            nn.Conv2d(inplans, planes // 4, kernel_size=1)
-        )
-
-        # 分解7x7卷积为三个3x3卷积
-        self.conv2_3 = nn.Sequential(
-            nn.Conv2d(inplans, inplans, kernel_size=3, padding=1, stride=stride, groups=inplans),
-            nn.Conv2d(inplans, inplans, kernel_size=3, padding=1, groups=inplans),
-            nn.Conv2d(inplans, inplans, kernel_size=3, padding=1, groups=inplans),
-            nn.Conv2d(inplans, planes // 4, kernel_size=1)
-        )
-
-        self.scale_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(planes, planes // 4, 1),
-            nn.ReLU(),
-            nn.Conv2d(planes // 4, 3, 1),
-            nn.Softmax(dim=1)
-        )
-    def forward(self, x):
-        out1 = self.conv2_1(x)
-        out2 = self.conv2_2(x)
-        out3 = self.conv2_3(x)
-
-        combined = torch.cat([out1, out2, out3], dim=1)
-        attn_weights = self.scale_attention(combined)  # [B, 3, 1, 1]
-        b, c, h, w = out1.shape
-        out1 = out1 * attn_weights[:, 0:1, :, :].expand_as(out1)
-        out2 = out2 * attn_weights[:, 1:2, :, :].expand_as(out2)
-        out3 = out3 * attn_weights[:, 2:3, :, :].expand_as(out3)
-        return torch.cat([out1, out2, out3], dim=1)
-
-class EfficientPyConv32(nn.Module):
     def __init__(self, inplans, planes, pyconv_kernels=[3, 5, 7], stride=1):
         super().__init__()
 
@@ -266,7 +221,7 @@ class PyConv3AdaptiveSEResDP(nn.Module):
 class PyConv3AdaptiveSEResDP2(nn.Module):
     def __init__(self, inplans, planes,drop_prob=0.1, *args):
         super(PyConv3AdaptiveSEResDP2, self).__init__()
-        self.pyconv = EfficientPyConv32(inplans, planes, *args)
+        self.pyconv = EfficientPyConv3(inplans, planes, *args)
         self.skip = conv(inplans, planes, kernel_size=1, padding=0) if inplans != planes else nn.Identity()
         self.se = SELayer2(planes)
         self.relu = nn.LeakyReLU(inplace=True)

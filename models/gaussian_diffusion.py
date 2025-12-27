@@ -566,7 +566,7 @@ class GaussianDiffusion:
             model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
             if tmodel is not None:
                 with torch.no_grad():
-                    t_model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
+                    t_model_output = tmodel(self._scale_input(z_t, t), t, **model_kwargs)
             target = {
                 ModelMeanType.START_X: z_start,
                 ModelMeanType.RESIDUAL: z_y - z_start,
@@ -583,7 +583,10 @@ class GaussianDiffusion:
                 weights = 1
             terms["mse"] *= weights
             if tmodel is not None:
-                terms["mse"] +=  0.1 * mean_flat(t_model_output - model_output)
+                # teacher loss
+                terms["distill_mse"] =  mean_flat((t_model_output.detach() - model_output)**2)
+            else:
+                terms["distill_mse"] = torch.zeros_like(terms["mse"])
         else:
             raise NotImplementedError(self.loss_type)
 

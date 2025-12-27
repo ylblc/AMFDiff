@@ -16,7 +16,68 @@ class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
         return super().forward(x.float()).type(x.dtype)
 
+class DepthwiseConv(nn.Module):
 
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=True,act=False,norm=False):
+        super(DepthwiseConv, self).__init__()
+        self.act = act
+        self.norm = norm
+        # 深度卷积
+        self.depthwise = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=in_channels,  # 输出通道数等于输入通道数
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_channels,  # 关键参数：分组数等于输入通道数
+            bias=bias
+        )
+
+        # 逐点卷积
+        self.pointwise = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=bias
+        )
+
+        # 可选的批归一化和激活函数
+        if self.norm:
+            self.bn1 = nn.BatchNorm2d(in_channels)
+            self.bn2 = nn.BatchNorm2d(out_channels)
+        if self.act:
+            self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+
+        x = self.depthwise(x)
+        if self.norm:
+            x = self.bn1(x)
+        if self.act:
+            x = self.activation(x)
+
+        x = self.pointwise(x)
+        if self.norm:
+            x = self.bn2(x)
+        if self.act:
+            x = self.activation(x)
+
+        return x
+def dw_conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        # TODO dw 1 dim
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return DepthwiseConv(*args, **kwargs)
+    elif dims == 3:
+        # TODO dw 3 dim
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
 def conv_nd(dims, *args, **kwargs):
     """
     Create a 1D, 2D, or 3D convolution module.

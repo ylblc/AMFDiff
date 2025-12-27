@@ -310,6 +310,9 @@ class TrainerBase:
             num_params = util_net.calculate_parameters(self.model) / 1000**2
             # self.logger.info("Detailed network architecture:")
             # self.logger.info(self.model.__repr__())
+            if self.tmodel:
+                tnum_params = util_net.calculate_parameters(self.tmodel) / 1000 ** 2
+                self.logger.info(f"Number of parameters(Teacher): {tnum_params:.2f}M")
             self.logger.info(f"Number of parameters: {num_params:.2f}M")
 
     def prepare_data(self, data, dtype=torch.float32, phase='train'):
@@ -1173,21 +1176,24 @@ class TrainerDifIRLPIPS(TrainerDifIR):
 
             if loss_coef[0] > 0:    # calculate mse in latent space
                 losses["mse"] *= loss_coef[0]
-            else:                   # calculate mse in pixel space
-                assert loss_coef[2] > 0
+            elif loss_coef[0] < 0:                   # calculate mse in pixel space
+                pixel_mse_weight = math.fabs(loss_coef[0])
                 losses["mse"] = mean_flat((x0_pred - micro_data['gt']) ** 2)
-                losses["mse"] *= loss_coef[2]
+                losses["mse"] *= pixel_mse_weight
 
             assert losses["mse"].shape == losses["lpips"].shape
             if flag_nan:
                 losses["loss"] = losses["mse"]
             else:
                 losses["loss"] = losses["mse"] + losses["lpips"]
+            if self.tmodel is not None:
+                losses["distill_mse"] *= loss_coef[2]
+                losses["loss"] = losses["mse"] + losses["lpips"] + losses["distill_mse"]
             ws = self.model.ws
             # if ws:
-                # prior_loss = 0.1 * self.prior_att_loss(ws)
-                # losses['prior'] = prior_loss
-                # losses['loss'] += prior_loss
+            #     prior_loss = self.att_loss(ws)
+            #     losses['prior'] = prior_loss
+            #     losses['loss'] += prior_loss
             loss = losses['loss'].mean() / num_grad_accumulate
         if self.amp_scaler is None:
             loss.backward()
@@ -1195,122 +1201,26 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             self.amp_scaler.scale(loss).backward()
         return losses, z0_pred, z_t
 
-    def prior_att(self):
+    def log_prior_att(self):
+        #  ws = [row,num_resblocks,bs,encoder_layers] = [4,3,4,4]
         ws = self.model.ws
-        if ws:
+        if ws and len(ws) > 0:
             s=""
-            for i, row in enumerate(ws):
+            for i, row in enumerate(ws): # row = [num_resblocks,bs,encoders]
                 row_s=""
-                for j, col in enumerate(row):
+
+                for j, col in enumerate(row):  #  col= [bs,encoders]
                     if len(col.shape) != 1:
-                        arr1 = [round(x,4) for x in col.mean(dim=0).tolist()]
-                    else:
-                        arr1 = [round(x,4) for x in col.tolist()]
+                       col = col.mean(dim=0)
+                    arr1 = [round(x, 4) for x in col.tolist()]
+                    # arr1 = [round(x, 4) for x in col.softmax(dim=0).tolist()]
                     row_s+=f'Decoder({i},{j})={arr1}  '
                 s+=row_s+"\n"
             self.logger.info(s)
-    def prior_att_loss(self,ws):
-        prior_loss = 0
-        consistency_loss = 0
-        target=[]
-        num_encoder = num_decoder = len(ws)
-        for i in range(num_decoder):
-            # 生成平滑的目标分布（距离目标层越近，权重越高）
-            target_row = []
-            target_encoder_layer = num_encoder - 1 - i
-            for encoder_layer in range(num_encoder):
-                distance = torch.tensor(abs(encoder_layer - target_encoder_layer))
-                weight = torch.exp(-distance / 1.2)  # 1.2为平滑系数，可调整
-                target_row.append(weight)
-            target.append(torch.tensor(target_row).to(ws[0][0].device).repeat(ws[0][0].size(0),1))
-        for i,row in enumerate(ws):
-            for j,col in enumerate(row):
-                prior_loss += mean_flat((col -target[i])**2)
-                position_variance=torch.var(torch.stack(row).permute(1,0,2),dim=1) # torch.stack(row)=[num_resblocks,bs,encoders] -> torch.stack(row).permute(1,0,2)=[bs,num_resblocks,encoders]
-                consistency_loss+= torch.mean(position_variance,dim=1) # (4,)
-        return  prior_loss + 0.1 * consistency_loss
-    def prior_att_loss2(self, ws):
-        """
-        适配ws结构的注意力损失函数：强化层级递进与同层一致性
-        ws结构：(解码器层, resblock数量, 注意力权重tensor)
-            - 解码器层：0=最深层（靠近瓶颈），num_decoder-1=最顶层（靠近输出）
-            - 注意力权重tensor：shape=(batch_size, num_encoder)，每个元素对应编码器0~3层的权重
+    def att_loss(self,ws,target_utilization=0.3, penalty_type='l1'):
 
-        返回：
-            总损失 = 先验分布损失（层级递进） + 一致性损失（同层resblock）* 权重
-        """
-        # 初始化损失
-        prior_loss = 0.0
-        consistency_loss = 0.0
-
-        # 解析ws的维度信息
-        num_decoder = len(ws)  # 解码器层数
-        if num_decoder == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        num_resblocks = len(ws[0])  # 每层的resblock数量
-        batch_size, num_encoder = ws[0][0].shape  # 批次大小和编码器层数
-        device = ws[0][0].device  # 设备一致性
-
-        # 生成目标分布：解码器深层（ws[0]）关注编码器深层，顶层关注编码器浅层
-        targets = []
-        for decoder_layer in range(num_decoder):
-            # 解码器层与目标编码器层的映射：
-            # decoder_layer=0（最深）→ 关注encoder最深层（num_encoder-1）
-            # decoder_layer增大（靠近输出）→ 关注的encoder层减小（靠近输入）
-            target_encoder_layer = num_encoder - 1 - decoder_layer
-
-            # 生成平滑的目标分布（距离目标层越近，权重越高）
-            target_row = []
-            for encoder_layer in range(num_encoder):
-                distance = abs(encoder_layer - target_encoder_layer)
-                weight = torch.exp(-distance / 1.2)  # 1.2为平滑系数，可调整
-                target_row.append(weight)
-
-            # 归一化确保是合法分布
-            target_row = torch.tensor(target_row, device=device)
-            target_row = target_row / target_row.sum()
-
-            # 扩展到批次维度：(batch_size, num_encoder)
-            targets.append(target_row.repeat(batch_size, 1))
-
-        # 计算先验损失：每个resblock的注意力与目标分布的差距
-        for decoder_layer in range(num_decoder):
-            target = targets[decoder_layer]  # 当前解码器层的目标分布
-            for resblock_idx in range(num_resblocks):
-                # 获取当前resblock的注意力权重：(batch_size, num_encoder)
-                att = ws[decoder_layer][resblock_idx]
-
-                # 用KL散度衡量分布差异（比MSE更适合概率分布）
-                prior_loss += torch.mean(
-                    torch.nn.functional.kl_div(
-                        att.log_softmax(dim=-1),  # 确保输入是log概率
-                        target.softmax(dim=-1),  # 目标分布的概率形式
-                        reduction='none'
-                    ).sum(dim=-1)  # 对编码器层维度求和
-                )
-
-        # 计算同层一致性损失：同一解码器层内不同resblock的注意力应相似
-        for decoder_layer in range(num_decoder):
-            # 收集当前解码器层所有resblock的注意力：(num_resblocks, batch_size, num_encoder)
-            resblock_atts = torch.stack([ws[decoder_layer][rb] for rb in range(num_resblocks)])
-
-            # 调整维度为：(batch_size, num_resblocks, num_encoder)
-            resblock_atts = resblock_atts.permute(1, 0, 2)
-
-            # 计算同一批次中，各resblock在编码器层上的方差（方差越小一致性越高）
-            resblock_var = torch.var(resblock_atts, dim=1)  # (batch_size, num_encoder)
-
-            # 平均得到当前解码器层的一致性损失
-            consistency_loss += torch.mean(resblock_var)
-
-        # 损失权重：增强一致性约束（根据实际效果可调整）
-        consistency_weight = 0.1
-
-        # 返回总损失（平均到每个解码器层和resblock，避免批次影响）
-        total_loss = (prior_loss / (num_decoder * num_resblocks)) + (consistency_weight * consistency_loss / num_decoder)
-
-        return total_loss
+        loss = 0
+        return loss
     def log_step_train(self, loss, tt, batch, z_t, z0_pred, phase='train'):
         '''
         param loss: a dict recording the loss informations
@@ -1338,15 +1248,15 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                     self.loss_count += 1e-4
                 for key in loss.keys():
                     self.loss_mean[key] /= self.loss_count
-                log_str = 'Train: {:06d}/{:06d}, MSE/LPIPS/Prior: '.format(
+                log_str = 'Train: {:06d}/{:06d}, MSE/LPIPS/Distill: '.format(
                         self.current_iters,
                         self.configs.train.iterations)
                 for jj, current_record in enumerate(record_steps):
-                    log_str += 't({:d}):{:.5e}/{:.5e}, '.format(
+                    log_str += 't({:d}):{:.5e}/{:.5e}/{:.5e} '.format(
                             current_record,
                             self.loss_mean['mse'][jj].item(),
                             self.loss_mean['lpips'][jj].item(),
-
+                            self.loss_mean["distill_mse"][jj].item()
                             )
                 log_str += 'lr:{:.2e}'.format(self.optimizer.param_groups[0]['lr'])
                 self.logger.info(log_str)
@@ -1366,7 +1276,7 @@ class TrainerDifIRLPIPS(TrainerDifIR):
             if self.current_iters % self.configs.train.save_freq == 0:
                 self.toc = time.time()
                 elaplsed = (self.toc - self.tic)
-                self.prior_att()
+                self.log_prior_att()
                 self.logger.info(f"Elapsed time: {elaplsed:.2f}s")
                 self.logger.info("="*100)
 

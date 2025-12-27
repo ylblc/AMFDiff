@@ -27,9 +27,9 @@ autoencoder:
       padding_mode: zeros
 
 #tmodel:
-#  target: models.unet.UNetModelSwin
+#  target: models.unet.UNetModelSwinPyConv4
 #  #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
-#  ckpt_path: weights/resshift_realsrx4_s4_v3.pth
+#  ckpt_path: weights/ema_model_60000.pth
 #  params:
 #    image_size: 64
 #    in_channels: 3
@@ -55,7 +55,7 @@ autoencoder:
 model:
   target: models.unet.UNetModelSwinPyConv5
   #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
-  ckpt_path: ~
+  ckpt_path: weights/lite_model_75000.pth
   params:
     image_size: 64
     in_channels: 3
@@ -77,7 +77,10 @@ model:
     mlp_ratio: 4
     cond_lq: True
     lq_size: 64
-
+    use_amf: True
+    topk_sparse: False
+    k_norm: True
+    k_list: [1,2,3,4]
 diffusion:
   target: models.script_util.create_gaussian_diffusion
   params:
@@ -199,7 +202,7 @@ train:
   # save logging
   save_freq: 2
   log_freq: [2,2,4]         # [training loss, training images, val images]
-  loss_coef: [1.0, 1.0]         # [mse, lpips]
+  loss_coef: [1.0, 1.0, 1.0]         # [mse, lpips]
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging
   # validation settings

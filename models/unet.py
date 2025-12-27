@@ -16,7 +16,7 @@ from .basic_ops import (
     avg_pool_nd,
     zero_module,
     normalization,
-    timestep_embedding,
+    timestep_embedding, dw_conv_nd,
 )
 from .swin_transformer import BasicLayer
 
@@ -61,14 +61,14 @@ class Upsample(nn.Module):
                  upsampling occurs in the inner-two dimensions.
     """
 
-    def __init__(self, channels, use_conv, dims=2, out_channels=None):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None,dw_conv=False):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
         self.dims = dims
         if use_conv:
-            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1)
+            self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=1) if not dw_conv else dw_conv_nd(dims, self.channels, self.out_channels, 3, padding=1)
 
     def forward(self, x):
         assert x.shape[1] == self.channels
@@ -90,7 +90,7 @@ class Downsample(nn.Module):
     :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
                  downsampling occurs in the inner-two dimensions.
     """
-    def __init__(self, channels, use_conv, dims=2, out_channels=None):
+    def __init__(self, channels, use_conv, dims=2, out_channels=None,dw_conv=False):
         super().__init__()
         self.channels = channels
         self.out_channels = out_channels or channels
@@ -100,7 +100,7 @@ class Downsample(nn.Module):
         if use_conv:
             self.op = conv_nd(
                 dims, self.channels, self.out_channels, 3, stride=stride, padding=1
-            )
+            ) if not dw_conv else dw_conv_nd(dims, self.channels, self.out_channels, 3, stride=stride, padding=1)
         else:
             assert self.channels == self.out_channels
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
@@ -206,7 +206,103 @@ class ResBlock(TimestepBlock):
             h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h
+class DwResBlock(TimestepBlock):
+    """
+    A residual block that can optionally change the number of channels.
+    :param channels: the number of input channels.
+    :param emb_channels: the number of timestep embedding channels.
+    :param dropout: the rate of dropout.
+    :param out_channels: if specified, the number of out channels.
+    :param use_conv: if True and out_channels is specified, use a spatial
+        convolution instead of a smaller 1x1 convolution to change the
+        channels in the skip connection.
+    :param dims: determines if the signal is 1D, 2D, or 3D.
+    :param up: if True, use this block for upsampling.
+    :param down: if True, use this block for downsampling.
+    """
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_conv=False,
+        use_scale_shift_norm=False,
+        dims=2,
+        up=False,
+        down=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.use_scale_shift_norm = use_scale_shift_norm
 
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            nn.SiLU(),
+            dw_conv_nd(dims, channels, self.out_channels, 3, padding=1),
+        )
+
+        self.updown = up or down
+
+        if up:
+            self.h_upd = Upsample(channels, False, dims,dw_conv=True)
+            self.x_upd = Upsample(channels, False, dims,dw_conv=True)
+        elif down:
+            self.h_upd = Downsample(channels, False, dims,dw_conv=True)
+            self.x_upd = Downsample(channels, False, dims,dw_conv=True)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(
+                dw_conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)
+            ),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv:
+            self.skip_connection = dw_conv_nd(
+                dims, channels, self.out_channels, 3, padding=1
+            )
+        else:
+            self.skip_connection = dw_conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x, emb):
+        if self.updown:
+            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+            h = in_rest(x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = in_conv(h)
+        else:
+            h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = th.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+        return self.skip_connection(x) + h
 def count_flops_attn(model, _x, y):
     """
     A counter for the `thop` package to count the operations in an
@@ -3129,6 +3225,10 @@ class UNetModelSwinPyConv5(nn.Module):
             cond_lq=True,
             cond_mask=False,
             lq_size=256,
+            use_amf=True,
+            topk_sparse=True,
+            k_norm=False,
+            k_list=None
     ):
         super().__init__()
 
@@ -3139,7 +3239,7 @@ class UNetModelSwinPyConv5(nn.Module):
         if num_heads == -1:
             assert swin_embed_dim % num_head_channels == 0 and num_head_channels > 0
         self.num_res_blocks = num_res_blocks
-
+        self.use_amf = use_amf
         self.image_size = image_size
         self.in_channels = in_channels
         self.model_channels = model_channels
@@ -3155,7 +3255,7 @@ class UNetModelSwinPyConv5(nn.Module):
         self.cond_mask = cond_mask
         self.skip_connections=nn.ModuleList([])
         self.afpfs = nn.ModuleList([])
-        self.aligns = nn.ModuleList([])
+        self.aligns = nn.ModuleDict()
         self.layer_selects = nn.ModuleList([])
         layer_chs = [int(model_channels * mult) for mult in channel_mult]
         layer_length = len(channel_mult)
@@ -3177,7 +3277,7 @@ class UNetModelSwinPyConv5(nn.Module):
             for ii in range(int(math.log(lq_size / image_size) / math.log(2))):
                 feature_extractor.append(nn.Conv2d(feature_chn, base_chn, 3, 1, 1))
                 feature_extractor.append(nn.SiLU())
-                feature_extractor.append(Downsample(base_chn, True, out_channels=base_chn*2))
+                feature_extractor.append(Downsample(base_chn, True, out_channels=base_chn*2,dw_conv=True))
                 base_chn *= 2
                 feature_chn = base_chn
             self.feature_extractor = nn.Sequential(*feature_extractor)
@@ -3187,7 +3287,7 @@ class UNetModelSwinPyConv5(nn.Module):
         in_channels += base_chn
         self.input_blocks = nn.ModuleList([
             # in_channels=6, ch=160
-                nn.ModuleList([TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))])
+                nn.ModuleList([TimestepEmbedSequential(dw_conv_nd(dims, in_channels, ch, 3, padding=1))])
             ]
         )
 
@@ -3200,7 +3300,7 @@ class UNetModelSwinPyConv5(nn.Module):
             input_block_chans.append([ch])
             for jj in range(num_res_blocks[level]):
                 layers = [
-                    ResBlock(
+                    DwResBlock(
                         ch,
                         time_embed_dim,
                         dropout,
@@ -3240,7 +3340,7 @@ class UNetModelSwinPyConv5(nn.Module):
                 out_ch = ch
                 self.input_blocks[level].append(
                     TimestepEmbedSequential(
-                        ResBlock(
+                        DwResBlock (
                             ch,
                             time_embed_dim,
                             dropout,
@@ -3251,7 +3351,7 @@ class UNetModelSwinPyConv5(nn.Module):
                         )
                         if resblock_updown
                         else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch
+                            ch, conv_resample, dims=dims, out_channels=out_ch,dw_conv=True
                         )
                     )
                 )
@@ -3261,7 +3361,7 @@ class UNetModelSwinPyConv5(nn.Module):
 
 
         self.middle_block = TimestepEmbedSequential(
-            ResBlock(
+            DwResBlock(
                 ch,
                 time_embed_dim,
                 dropout,
@@ -3286,7 +3386,7 @@ class UNetModelSwinPyConv5(nn.Module):
                 norm_layer=normalization,
                 patch_norm=patch_norm,
             ),
-            ResBlock(
+            DwResBlock(
                 ch,
                 time_embed_dim,
                 dropout,
@@ -3308,7 +3408,7 @@ class UNetModelSwinPyConv5(nn.Module):
                 ich = input_block_chans[level].pop()  # 编码器层的输出通道数
 
                 layers = [
-                    ResBlock(
+                    DwResBlock(
 
                         ch + ich,
                         time_embed_dim,
@@ -3318,9 +3418,10 @@ class UNetModelSwinPyConv5(nn.Module):
                         use_scale_shift_norm=use_scale_shift_norm,
                         )
                 ]
-                self.skip_connections[index].append(
-                    PyConv3AdaptiveSEResDP2(ich, ich)
-                )
+                if self.use_amf:
+                    self.skip_connections[index].append(
+                        PyConv3AdaptiveSEResDP2(ich, ich)
+                    )
                 ch = int(model_channels * mult)
 
                 if ds in attention_resolutions and i==0:
@@ -3348,7 +3449,7 @@ class UNetModelSwinPyConv5(nn.Module):
                 if level and i == num_res_blocks[level]:
                     out_ch = ch
                     layers.append(
-                        ResBlock(
+                        DwResBlock(
                             ch,
                             time_embed_dim,
                             dropout,
@@ -3358,7 +3459,7 @@ class UNetModelSwinPyConv5(nn.Module):
                             up=True,
                         )
                         if resblock_updown
-                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
+                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch,dw_conv=True)
                     )
                     ds *= 2
 
@@ -3368,41 +3469,61 @@ class UNetModelSwinPyConv5(nn.Module):
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
-            conv_nd(dims, input_ch, out_channels, 3, padding=1),
+            dw_conv_nd(dims, input_ch, out_channels, 3, padding=1),
         )
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            index = len(channel_mult) - level - 1
-            layer_length = len(channel_mult)
-            self.aligns.append(nn.ModuleList([]))
-            for i in range(num_res_blocks[level] + 1):
-                ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
-                self.aligns[index].append(
-                    FeatureAlign2(layer_chs, ich)
-                )
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-            self.afpfs.append(nn.ModuleList([]))
-            index = len(channel_mult) - level - 1
-            for i in range(num_res_blocks[level] + 1):
-                ich = input_block_chans3[level].pop()  # 编码器层的输出通道数
-                self.afpfs[index].append(
-                        SCAttentionAFPF3(layer_chs, ich,time_emb_dim=time_embed_dim)
-                )
-        for level, mult in list(enumerate(channel_mult))[::-1]:
-
-            index = len(channel_mult) - level - 1
-
-            self.layer_selects.append(nn.ModuleList())
-            ch = int(model_channels * mult)
-            for i in range(num_res_blocks[level] + 1):
-                ich = input_block_chans4[level].pop()  # 编码器层的输出通道数
-                if i == 0:
-                    self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_chs,int(model_channels * channel_mult[min(layer_length - 1, level + 1)]))
+        if self.use_amf:
+            for level, mult in list(enumerate(channel_mult))[::-1]:
+                # index = len(channel_mult) - level - 1
+                # layer_length = len(channel_mult)
+                ch = int(model_channels * mult)
+                if f'{ch}' not in self.aligns:
+                    self.aligns[f'{ch}'] = FeatureAlign2(layer_chs, ch)
+                # self.aligns.append(nn.ModuleList([]))
+                # for i in range(num_res_blocks[level] + 1):
+                #     ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
+                #     self.aligns[index].append(
+                #         FeatureAlign2(layer_chs, ich)
+                #     )
+            for level, mult in list(enumerate(channel_mult))[::-1]:
+                self.afpfs.append(nn.ModuleList([]))
+                index = len(channel_mult) - level - 1
+                for i in range(num_res_blocks[level] + 1):
+                    ich = input_block_chans3[level].pop()  # 编码器层的输出通道数
+                    self.afpfs[index].append(
+                            SCAttentionAFPF3(layer_chs, ich,time_emb_dim=time_embed_dim)
                     )
-                else:
-                    self.layer_selects[index].append(
-                        AdaptiveFeatureSelect4(layer_chs, ch)
-                    )
+            for level, mult in list(enumerate(channel_mult))[::-1]:
+
+                index = len(channel_mult) - level - 1
+
+                self.layer_selects.append(nn.ModuleList())
+                ch = int(model_channels * mult)
+                for i in range(num_res_blocks[level] + 1):
+                    ich = input_block_chans4[level].pop()  # 编码器层的输出通道数
+                    if i == 0:
+                        self.layer_selects[index].append(
+                            AdaptiveFeatureSelect4(layer_chs,
+                                                   int(model_channels * channel_mult[min(layer_length - 1, level + 1)]),
+                                                   k_list=k_list,
+                                                   norm=k_norm,
+                                                   topk_sparse=topk_sparse)
+                            # AdaptiveFeatureSelect4(layer_chs,
+                            #                        ich,
+                            #                        k_list=k_list,
+                            #                        topk_sparse=topk_sparse)
+                        )
+                    else:
+                        self.layer_selects[index].append(
+                            AdaptiveFeatureSelect4(layer_chs,
+                                                   ch,
+                                                   k_list=k_list,
+                                                   norm=k_norm,
+                                                   topk_sparse=topk_sparse)
+                            # AdaptiveFeatureSelect4(layer_chs,
+                            #                        ich,
+                            #                        k_list=k_list,
+                            #                        topk_sparse=topk_sparse)
+                        )
 
 
         self.ws=[]
@@ -3446,20 +3567,24 @@ class UNetModelSwinPyConv5(nn.Module):
             for jj,module in enumerate(module_list):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
-                target_size = res_h.shape[2:]
-                afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h) #  weights = [batchsize,encoder]
-                # afpf_features = [(hs[i][-1],i) for i in range(3)]
-                self.ws[ii].append(weights)
-                afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
-                # # 1、多尺度特征融合
-                multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h,emb)
-                # multi_h =0
-                # for afpf_aligned_feature in afpf_aligned_features:
-                #     multi_h+=afpf_aligned_feature
-                # multi_h += res_h
-                # 1、skip跳越层
-                skip_h = self.skip_connections[ii][jj](res_h)
-                res_h = multi_h + skip_h
+                if self.use_amf:
+                    target_size = res_h.shape[2:]
+                    target_ch = res_h.shape[1]
+                    afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h) #  weights = [batchsize,encoder]
+                    # afpf_features = [(hs[i][-1],i) for i in range(3)]
+                    self.ws[ii].append(weights)
+                    # afpf_aligned_features = self.aligns[ii][jj](afpf_features,target_size)
+                    afpf_aligned_features = self.aligns[f'{target_ch}'](afpf_features,target_size)
+                    # # 1、多尺度特征融合
+                    multi_h = self.afpfs[ii][jj](afpf_aligned_features,res_h,emb)
+                    # multi_h =0
+                    # for afpf_aligned_feature in afpf_aligned_features:
+                    #     multi_h+=afpf_aligned_feature
+                    # multi_h += res_h
+                    multi_h = self.skip_connections[ii][jj](multi_h)
+                    # 1、skip跳越层
+                    skip_h = self.skip_connections[ii][jj](res_h)
+                    res_h = skip_h + multi_h
                 h = th.cat([h, res_h], dim=1)
                 h = module(h, emb)
         h = h.type(x.dtype)
@@ -3699,8 +3824,10 @@ class AdaptiveFeatureSelect4(nn.Module):
 
         self.key_fusion_weights = nn.Parameter(torch.tensor(0.5))  # 初始平衡
         k_len = len(self.k_list)
+        self.k_len = k_len
         # self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,))/k_len,requires_grad=True)
-        self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,)), requires_grad=True)
+        if self.k_len > 1:
+            self.sparse_weights = torch.nn.Parameter(torch.ones(size=(k_len,))/k_len,requires_grad=True)
     def forward(self, encoder_features,layer_idx,query_feat):
         """
         encoder_features: 编码器特征二维数组，encoder_features[i][j] = [B, C, H, W]
@@ -3751,11 +3878,11 @@ class AdaptiveFeatureSelect4(nn.Module):
             keys = F.layer_norm(keys, normalized_shape=(self.embedding_dim,))  # 对最后一个维度归一化
             keys = keys.transpose(1, 2)  # [B, embedding_dim, num_encoder_layers]
         # ========================= attention ======================================
-        attn_scores = torch.bmm(query, keys).squeeze(1)  # [B, num_encoder_layers]
+        attn_scores = torch.bmm(query, keys).squeeze(1) / math.sqrt(self.embedding_dim)  # [B, num_encoder_layers]
         temperature = torch.exp(self.log_temperature)
         attn_scores = attn_scores / temperature
         final_features = []
-
+        attn_weights_output = 0
         # 1、topk稀疏化权重计算 计算不同K值的注意力
         if self.topk_sparse:
             selection_probs = F.gumbel_softmax(attn_scores)
@@ -3768,24 +3895,36 @@ class AdaptiveFeatureSelect4(nn.Module):
                 # 方式一（硬选择，1/0）：
                 attn = (mask - selection_probs).detach() + selection_probs
                 topk_att_list.append(attn)
-                attn_weights += attn * self.sparse_weights[idx]
-
-                # 方式二（类硬选择，float/0）：
-                # attn = torch.where(mask > 0, attn_scores, torch.full_like(attn_scores, float('-inf')))
-                # attn = F.softmax(attn , dim=-1)  # [B, num_encoder_layers]
-                # topk_att_list.append(attn)
-                # attn_weights += attn * self.sparse_weights[idx]
+                if self.k_len > 1:
+                    attn_weights += attn * self.sparse_weights[idx]
+                else:
+                    attn_weights += attn
+            attn_weights_output = attn_weights
+        else:
+            # 2、原注意力权重计算 软选择
+            topk_att_list = []
+            attn_weights = 0
+            for idx,k in enumerate(self.k_list):
+                index = torch.topk(attn_scores, k=k, dim=-1, largest=True)[1]
+                mask = torch.zeros_like(attn_scores, device=attn_scores.device, requires_grad=False)
+                mask.scatter_(1, index, 1.)
+                attn = torch.where(mask > 0, attn_scores, torch.full_like(attn_scores, float('-inf')))
+                attn = F.softmax(attn , dim=-1)  # [B, num_encoder_layers]
+                topk_att_list.append(attn)
+                if self.k_len > 1:
+                    attn_weights += attn * self.sparse_weights[idx]
+                else:
+                    attn_weights += attn
 
             # 归一化（0 除外）
             # attn_weights /= len(topk_att_list)
-        else:
-            # 2、原注意力权重计算 软选择
-            attn_weights = F.softmax(attn_scores, dim=1)  # [B, num_encoder_layers]
+            # attn_weights = F.softmax(attn_scores, dim=1)  # [B, num_encoder_layers]
+            attn_weights_output = attn_weights
         for i, row in enumerate(encoder_features):
             feature = row[-1] if isinstance(row, (list, tuple)) else row
             weighted_feature = feature * attn_weights[:, i].view(batch_size, 1, 1, 1)
             final_features.append((weighted_feature, i))
-        return final_features, attn_scores
+        return final_features, attn_weights_output
 class SCAttentionAFPF(nn.Module):
     def __init__(self, in_channels_list, out_channels=256, reduction=8):
         super().__init__()
@@ -3989,15 +4128,16 @@ class FeatureAlign2(nn.Module):
             self.aligners[f'layer_{i}'] = channel_aligner
 
         self.scale_weights = nn.Parameter(torch.ones(len(channels_list)))
-    def forward(self, features, target_size):
+    def forward(self, features, target_size =None):
 
         aligned_features = []
 
         for feat,idx in features:
 
-            channel_aligned = self.aligners[f'layer_{idx}'](feat)
-            spatial_aligned = self._pyramid_align(channel_aligned, target_size, idx)
-            aligned_features.append(spatial_aligned)
+            aligned_f = self.aligners[f'layer_{idx}'](feat)
+            if target_size is not None:
+                aligned_f = self._pyramid_align(aligned_f, target_size, idx)
+            aligned_features.append(aligned_f)
         return aligned_features
 
     def _pyramid_align(self, feat, target_size, layer_idx):

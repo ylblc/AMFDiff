@@ -1262,15 +1262,15 @@ if __name__ == "__main__":
     }
 
     # 使用函数绘制图表
-    fig, ax = plot_training_trends(
-        data_dict=data_dict,
-        output_path="picture/g3",  # 保存为高分辨率PNG
-        title="Validation PSNR curves of different models during training",
-        x_label="iterations",
-        y_label="PSNR(dB)",
-        y_range=[19, 25],  # 设置Y轴范围
-        dpi=1000  # 设置高分辨率
-    )
+    # fig, ax = plot_training_trends(
+    #     data_dict=data_dict,
+    #     output_path="picture/g3",  # 保存为高分辨率PNG
+    #     title="Validation PSNR curves of different models during training",
+    #     x_label="iterations",
+    #     y_label="PSNR(dB)",
+    #     y_range=[19, 25],  # 设置Y轴范围
+    #     dpi=1000  # 设置高分辨率
+    # )
 # ======================= 注意力图 ===============================
     data = np.zeros((4, 4, 4))
 

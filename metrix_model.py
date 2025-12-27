@@ -245,7 +245,7 @@ def flops(model,input=None):
     flops = FlopCountAnalysis(model, (tensor,t,lq))
     total = flops.total()
     print(f"Total FLOPs: ", total)
-    print(f"Total FLOPs (G): {total / 1e9} G")  # 转换为十亿次单位(G)
+    print(f"Total FLOPs (G): {total / 1e9:.4} G")  # 转换为十亿次单位(G)
     # 分析parameters
     print(parameter_count_table(model))
     return total
@@ -483,8 +483,8 @@ if __name__ == '__main__':
     args.cfg_path='configs/realsr_swinunet_realesrgan256_test.yaml'
     in_path_dir= "testdata/Val_SR"
     (configs, chop_stride) = get_configs(args)
-    configs.model.target = 'models.unet.UNetModelSwinPyConv4'
-    configs.model.ckpt_path = 'weights/exp/all3-2layer-65000.pth'
+    configs.model.target = 'models.unet.UNetModelSwinPyConv5'
+    configs.model.ckpt_path = 'weights/lite_model_75000.pth'
     # weights/exp/no-no-mfr11-60000.pth
     # 'weights/dfs2-aff-pc-60000.pth'
     # weights/01-aff-mfr_60000.pth
@@ -492,34 +492,34 @@ if __name__ == '__main__':
     # weights/resshift_realsrx4_s4_v3.pth
     # weights/exp/mybase-4-90000.pth
     # 1、计算flops
-    # model = get_model(configs)
+    model = get_model(configs)
     # flops(model)
 
     # 2、适合于消融测试
-    # metrix_model_baseline_model(configs, in_path_dir+"/lq",
-    #                             in_path_dir+"/gt",
-    #                             chop_stride=chop_stride,
-    #                             output_dir="test_set5" ,
-    #                             save_img=False,
-    #                             )
+    metrix_model_baseline_model(configs, in_path_dir+"/lq",
+                                in_path_dir+"/gt",
+                                chop_stride=chop_stride,
+                                output_dir="test_set5" ,
+                                save_img=False,
+                                )
 
 
     # 3、对比实验测试指标：跨sr目录测试指标psnr、lpips、ssim...
     # rename("../DASR-master/results/DASR2/visualization/RealSet80","_DASR2")
-    sr_imgs_dir = "result/realsr-jpeg/realset80"
-    key="realsrjpeg-realset80"
-    gt_dir = "testdata/RealSRx4/gt"
-
-    s = f"gt_dir: {gt_dir}\n"
-    psnr, lpips, ssim, m, c = batch_metrix(gt_dir, sr_imgs_dir,only_musiq_iqa= True)
-    s+=f"{key}[{sr_imgs_dir}] —— PSNR: {psnr:.4f},LPIPS: {lpips:.4f},SSIM: {ssim:.4f},Musiq: {m.item():.4f},ClipIQA: {c.item():.4f}\n"
-    s+="="*50
-    print(s)
-    shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
-    start_time = datetime.datetime.now(shanghai_tz)
-    logger.remove(0)
-    logger.add(f"m/{start_time.strftime('%Y-%m-%d-%H-%M-%S')}_{key}.log")
-    logger.info(s)
+    # sr_imgs_dir = "result/realsr-jpeg/realset80"
+    # key="realsrjpeg-realset80"
+    # gt_dir = "testdata/RealSRx4/gt"
+    #
+    # s = f"gt_dir: {gt_dir}\n"
+    # psnr, lpips, ssim, m, c = batch_metrix(gt_dir, sr_imgs_dir,only_musiq_iqa= True)
+    # s+=f"{key}[{sr_imgs_dir}] —— PSNR: {psnr:.4f},LPIPS: {lpips:.4f},SSIM: {ssim:.4f},Musiq: {m.item():.4f},ClipIQA: {c.item():.4f}\n"
+    # s+="="*50
+    # print(s)
+    # shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
+    # start_time = datetime.datetime.now(shanghai_tz)
+    # logger.remove(0)
+    # logger.add(f"m/{start_time.strftime('%Y-%m-%d-%H-%M-%S')}_{key}.log")
+    # logger.info(s)
 
     # 4、生成线性插值图片
     # bicubic("testdata/RealSet80","result/bicubic/realset80",scale_factor=4)
