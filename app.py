@@ -180,6 +180,8 @@ demo = gr.Interface(
       ]
     )
 
-demo.queue(concurrency_count=4)
-demo.launch(share=True)
-
+# demo.queue(concurrency_count=4)
+# demo.launch(share=True)
+if __name__ == "__main__":
+    demo.queue(concurrency_count=4)
+    demo.launch(share=True)

@@ -1,5 +1,7 @@
-from inference_resshift import *
+import os
+import sys
 
+from inference_resshift import main
 
 
 def run_inference(

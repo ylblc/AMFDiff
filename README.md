@@ -45,7 +45,10 @@ You can try our method through an online demo:
 ```
 python app.py
 ```
-
+or you can also launch an API interface for other programs to call
+```
+uvicorn fast-app:final_app
+```
 ## License
 
 This project is licensed under <a rel="license" href="https://github.com/sczhou/CodeFormer/blob/master/LICENSE">NTU S-Lab License 1.0</a>. Redistribution and use should follow this license.
