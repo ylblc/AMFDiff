@@ -54,3 +54,13 @@ This project is licensed under <a rel="license" href="https://github.com/sczhou/
 
 This project is based on [Improved Diffusion Model](https://github.com/openai/improved-diffusion), [LDM](https://github.com/CompVis/latent-diffusion), and [BasicSR](https://github.com/XPixelGroup/BasicSR). We also adopt [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) to synthesize the training data for real-world super-resolution. Thanks for their awesome works.
 
+```bibtex
+@inproceedings{yue2023resshift,
+  title={ResShift: Efficient Diffusion Model for Image Super-resolution by Residual Shifting},
+  author={Yue, Zongsheng and Wang, Jianyi and Loy, Chen Change},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2023},
+  volume = {36},
+  pages = {13294--13307},
+}
+```

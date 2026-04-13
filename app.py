@@ -144,37 +144,14 @@ def predict(in_path, task='realsrx4', seed=12345, scale=4, version='v3'):
 
     return im_sr, str(out_path)
 
-title = "ResShift: Efficient Diffusion Model for Image Super-resolution by Residual Shifting"
+title = "AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution"
 description = r"""
-<b>Official Gradio demo</b> for <a href='https://github.com/zsyOAOA/ResShift' target='_blank'><b>ResShift: Efficient Diffusion Model for Image Super-resolution by Residual Shifting</b></a>.<br>
-🔥 ResShift is an efficient diffusion model designed for image super-resolution or restoration.<br>
+<b>Official Gradio demo</b> for <a href='https://github.com/zsyOAOA/ResShift' target='_blank'><b>AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution</b></a>.<br>
+🔥 AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution.<br>
 """
 article = r"""
-If ResShift is helpful for your work, please help to ⭐ the <a href='https://github.com/zsyOAOA/ResShift' target='_blank'>Github Repo</a>. Thanks!
-[![GitHub Stars](https://img.shields.io/github/stars/zsyOAOA/ResShift?affiliations=OWNER&color=green&style=social)](https://github.com/zsyOAOA/ResShift)
+If AMFDiff is helpful for your work, please help to ⭐ the <a href='https://github.com/ylblc/AMFDiff' target='_blank'>Github Repo</a>. Thanks!
 
----
-If our work is useful for your research, please consider citing:
-```bibtex
-@inproceedings{yue2023resshift,
-  title={ResShift: Efficient Diffusion Model for Image Super-resolution by Residual Shifting},
-  author={Yue, Zongsheng and Wang, Jianyi and Loy, Chen Change},
-  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
-  year={2023},
-  volume = {36},
-  pages = {13294--13307},
-}
-```
-
-📋 **License**
-
-This project is licensed under <a rel="license" href="https://github.com/zsyOAOA/ResShift/blob/master/LICENSE">S-Lab License 1.0</a>.
-Redistribution and use for non-commercial purposes should follow this license.
-
-📧 **Contact**
-
-If you have any questions, please feel free to contact me via <b>zsyzam@gmail.com</b>.
-![visitors](https://visitor-badge.laobi.icu/badge?page_id=zsyOAOA/ResShift)
 """
 demo = gr.Interface(
     fn=predict,
