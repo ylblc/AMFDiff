@@ -4,7 +4,7 @@ AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution
 ## Requirements
 * Python 3.10, Pytorch 2.1.2, [xformers](https://github.com/facebookresearch/xformers) 0.0.23
 * More detail (See [environment.yml](environment.yml))
-A suitable [conda](https://conda.io/) environment named `resshift` can be created and activated with:
+A suitable [conda](https://conda.io/) environment named `amfdiff` can be created and activated with:
 
 ```
 conda create -n amfdiff python=3.10
@@ -28,7 +28,7 @@ conda activate amfdiff
 
 #### :whale: Real-world Image Super-resolution 
 ```
-python main.py --cfg_path configs/py-realsr.yaml --save_dir logs 
+python main.py --cfg_path configs/realsr_swinunet_realesrgan256_my.yaml --save_dir logs 
 ```
 
 ## Fast Testing
