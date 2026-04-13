@@ -1163,17 +1163,18 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                     self.autoencoder,
                     ) # f16
             self.current_x0_pred = x0_pred.detach()
-
+            if loss_coef[1] != 0:
             # lpips loss
-            losses["lpips"] = self.lpips_loss(
-                    x0_pred,
-                    micro_data['gt'],
-                    ).to(z0_pred.dtype).view(-1)
+                losses["lpips"] = self.lpips_loss(
+                        x0_pred,
+                        micro_data['gt'],
+                        ).to(z0_pred.dtype).view(-1)
+            else:
+                losses["lpips"] = torch.full_like(losses["mse"],torch.nan)
             flag_nan = torch.any(torch.isnan(losses["lpips"]))
             if flag_nan:
                 losses["lpips"] = torch.nan_to_num(losses["lpips"], nan=0.0)
             losses["lpips"] *= loss_coef[1]
-
             if loss_coef[0] > 0:    # calculate mse in latent space
                 losses["mse"] *= loss_coef[0]
             elif loss_coef[0] < 0:                   # calculate mse in pixel space
@@ -1188,7 +1189,11 @@ class TrainerDifIRLPIPS(TrainerDifIR):
                 losses["loss"] = losses["mse"] + losses["lpips"]
             if self.tmodel is not None:
                 losses["distill_mse"] *= loss_coef[2]
-                losses["loss"] = losses["mse"] + losses["lpips"] + losses["distill_mse"]
+                losses["distill_features"] *= loss_coef[3]
+                if flag_nan:
+                    losses["loss"] = losses["mse"] + losses["distill_mse"] + losses["distill_features"]
+                else:
+                    losses["loss"] = losses["mse"] + losses["lpips"] + losses["distill_mse"] + losses["distill_features"]
             ws = self.model.ws
             # if ws:
             #     prior_loss = self.att_loss(ws)

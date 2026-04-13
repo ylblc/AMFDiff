@@ -248,7 +248,7 @@ class ResShiftSampler(BaseSampler):
             bs: int, default bs=1, bs % num_gpus == 0
             mask_path: image mask for inpainting
         '''
-        def _process_per_image(im_lq_tensor, mask=None):
+        def  _process_per_image(im_lq_tensor, mask=None):
             '''
             Input:
                 im_lq_tensor: b x c x h x w, torch tensor, [-1, 1], RGB
@@ -346,7 +346,9 @@ class ResShiftSampler(BaseSampler):
                     drop_last=False,
                     )
             shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
-            start_time = datetime.datetime.now(shanghai_tz)
+            total_time = 0
+            total_count = 0
+            length = len(dataset)
             for data in dataloader:
                 micro_batchsize = math.ceil(bs / self.num_gpus)
                 ind_start = self.rank * micro_batchsize
@@ -354,39 +356,44 @@ class ResShiftSampler(BaseSampler):
                 micro_data = {key:value[ind_start:ind_end] for key,value in data.items()}
 
                 if micro_data['lq'].shape[0] > 0:
+                    start_time = datetime.datetime.now(shanghai_tz)
                     results = _process_per_image(
                             micro_data['lq'].cuda(),
                             mask=micro_data['mask'].cuda() if 'mask' in micro_data else None,
                             )    # b x h x w x c, [0, 1], RGB
-
+                    end_time = datetime.datetime.now(shanghai_tz)
+                    duration = (end_time - start_time).total_seconds()
+                    total_time += duration
+                    total_count += micro_data['lq'].shape[0]
+                    self.write_log(f'Duration {duration} s ({total_count}/{length}) , device={results.device}')
                     for jj in range(results.shape[0]):
                         im_sr = util_image.tensor2img(results[jj], rgb2bgr=True, min_max=(0.0, 1.0))
                         im_name = Path(micro_data['path'][jj]).stem
                         im_path = out_path / f"{im_name}.png"
                         util_image.imwrite(im_sr, im_path, chn='bgr', dtype_in='uint8')
-            end_time = datetime.datetime.now(shanghai_tz)
-            duration = (end_time - start_time).total_seconds()
-            self.write_log(f'Duration {duration} s')
+            self.write_log(f'total_time: {total_time} s')
+            self.write_log(f'total_count: {total_count} s')
+            self.write_log(f'avg: {total_time/total_count} s')
             if self.num_gpus > 1:
                 dist.barrier()
         else:
             shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
-            start_time = datetime.datetime.now(shanghai_tz)
+
             im_lq = util_image.imread(in_path, chn='rgb', dtype='float32')  # h x w x c
             im_lq_tensor = util_image.img2tensor(im_lq).cuda()              # 1 x c x h x w
             if mask_path is not None:
                 im_mask = util_image.imread(mask_path, chn='gray', dtype='float32')[:,:, None]  # h x w x 1
                 im_mask_tensor = util_image.img2tensor(im_mask).cuda()              # 1 x c x h x w
-
+            start_time = datetime.datetime.now(shanghai_tz)
             im_sr_tensor = _process_per_image(
                     (im_lq_tensor - 0.5) / 0.5,
                     mask=(im_mask_tensor - 0.5) / 0.5 if mask_path is not None else None,
                     )
-
+            end_time = datetime.datetime.now(shanghai_tz)
             im_sr = util_image.tensor2img(im_sr_tensor, rgb2bgr=True, min_max=(0.0, 1.0))
             im_path = out_path / f"{in_path.stem}.png"
             util_image.imwrite(im_sr, im_path, chn='bgr', dtype_in='uint8')
-            end_time = datetime.datetime.now(shanghai_tz)
+
             duration = (end_time - start_time).total_seconds()
             self.write_log(f'Duration {duration} s')
         self.write_log(f"Processing done, enjoy the results in {str(out_path)}")
@@ -489,6 +496,7 @@ class ResShiftSampler(BaseSampler):
                                               }
                                    }
                 dataset = create_dataset(data_config)
+                length  = len(dataset)
                 self.write_log(f'Find {len(dataset)} images in {in_path}')
                 dataloader = torch.utils.data.DataLoader(
                         dataset,
@@ -496,6 +504,9 @@ class ResShiftSampler(BaseSampler):
                         shuffle=False,
                         drop_last=False,
                         )
+                shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
+                total_time = 0
+                total_count = 0
                 for data in dataloader:
                     micro_batchsize = math.ceil(bs / self.num_gpus)
                     ind_start = self.rank * micro_batchsize
@@ -503,28 +514,46 @@ class ResShiftSampler(BaseSampler):
                     micro_data = {key:value[ind_start:ind_end] for key,value in data.items()}
 
                     if micro_data['lq'].shape[0] > 0:
+                        start_time = datetime.datetime.now(shanghai_tz)
                         results = _process_per_image(
                                 micro_data['lq'].cuda(),
                                 mask=micro_data['mask'].cuda() if 'mask' in micro_data else None,
                                 )    # b x h x w x c, [0, 1], RGB
+                        end_time = datetime.datetime.now(shanghai_tz)
+                        duration = (end_time - start_time).total_seconds()
+                        total_time += duration
+                        total_count += micro_data['lq'].shape[0]
+                        self.write_log(f'Duration {duration} s ({total_count}/{length})')
                         im_sr_tensors.append(results)
                         for jj in range(results.shape[0]):
                             im_sr = util_image.tensor2img(results[jj],  min_max=(0.0, 1.0))
                             im_srs.append(im_sr)
+                self.write_log(f'total_time: {total_time} s')
+                self.write_log(f'total_count: {total_count} ')
+                self.write_log(f'avg: {total_time / total_count} s')
                 if self.num_gpus > 1:
                     dist.barrier()
             else:
+                shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
+                total_time = 0
+                total_count = 0
                 im_lq = util_image.imread(in_path, chn='rgb', dtype='float32')  # h x w x c
                 im_lq_tensor = util_image.img2tensor(im_lq).cuda()              # 1 x c x h x w
                 if mask_path is not None:
                     im_mask = util_image.imread(mask_path, chn='gray', dtype='float32')[:,:, None]  # h x w x 1
                     im_mask_tensor = util_image.img2tensor(im_mask).cuda()              # 1 x c x h x w
-
+                start_time = datetime.datetime.now(shanghai_tz)
                 im_sr_tensor = _process_per_image(
                         (im_lq_tensor - 0.5) / 0.5,
                         mask=(im_mask_tensor - 0.5) / 0.5 if mask_path is not None else None,
                         )
-
+                end_time = datetime.datetime.now(shanghai_tz)
+                duration = (end_time - start_time).total_seconds()
+                total_time += duration
+                total_count +=1
+                self.write_log(f'total_time: {total_time} s')
+                self.write_log(f'total_count: {total_count} s')
+                self.write_log(f'avg: {total_time / total_count} s')
                 im_sr = util_image.tensor2img(im_sr_tensor, min_max=(0.0, 1.0))
                 im_srs.append(im_sr)
                 im_sr_tensors.append(im_sr_tensor)

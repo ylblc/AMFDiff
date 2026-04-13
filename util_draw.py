@@ -9,6 +9,7 @@ from PIL import Image, ImageFont, ImageDraw
 from typing import Dict, List, Tuple, Optional, Union
 
 from matplotlib import pyplot as plt
+import seaborn as sns
 
 from utils import util_image
 
@@ -445,7 +446,7 @@ def crop_images2(
                 bottom = top + target_height
 
                 # 检查是否需要放大图像
-                if not allow_upscaling and (width < target_width or height < target_height):
+                if not allow_upscaling and ((width < target_width or height < target_height) or (width < left and height < top)):
                     if scale is None:
                         print(
                             f"跳过 {input_path}: 原图尺寸 ({width}x{height}) 小于目标尺寸 ({target_width}x{target_height})")
@@ -1172,7 +1173,7 @@ def visualize_attention_3d(attention_data,
 
     return fig, axes
 
-def get_pictures(imgs_names_dir = "picture/my/sr2"):
+def get_pictures(imgs_names_dir = "picture/my/sr"):
     '''
     根据 imgs_names_dir = "picture/my"中存放的图片，从其他模型图片文件夹里去搜集，分门别类放入到target_dir_name = "picture"
 
@@ -1180,12 +1181,28 @@ def get_pictures(imgs_names_dir = "picture/my/sr2"):
 
     '''
     input_dir = "result"
-    imgs_names = []
-    model_names = ["bicubic", "bsrgan", "esrgan", "diffir", "mybase_90000", "realesr-gan", "swinir", "all3-40000","all3-2layer-55000","mybase-2layer-90000"]
     target_dir_name = "picture"
-    exts = ['png', 'jpg', 'jpeg']
-    possible_dirs = ["realset80", "realsr","imagenet-test"]
 
+    model_names = ["bicubic",
+                   "bsrgan",
+                   "esrgan",
+                   "diffir",
+                   "mybase_90000",
+                   "realesr-gan",
+                   "swinir",
+                   "sinsr",
+                   "diffbir",
+                   "2layer-stu-16000-multi_step-k2",
+                   "2layer_stu_30000-one_step"
+                   # "all3-40000",
+                   # "all3-2layer-55000",
+                   # "mybase-2layer-90000"
+                   ]
+    exts = ['png', 'jpg', 'jpeg']
+    possible_dirs = ["realset80", "realsr","imagenet-test","imagenet256","imagenet"]
+    imgs_names = []
+    gt_imgs_paths=["testdata/imagenet256/gt","testdata/RealSRx4/gt"]
+    lq_imgs_paths=["testdata/imagenet256/lq","testdata/RealSRx4/lq","testdata/RealSet80"]
     for file_name in os.listdir(imgs_names_dir):
         imgs_names.append(file_name)
 
@@ -1193,8 +1210,9 @@ def get_pictures(imgs_names_dir = "picture/my/sr2"):
         fn, ext = os.path.splitext(file_name)
         ext = ext.lstrip('.')
         target_dir = os.path.join(target_dir_name, fn)
-        if not os.path.exists(target_dir):
-            os.makedirs(target_dir)
+        target_dir2 = os.path.join(target_dir, "sr")
+        if not os.path.exists(target_dir2):
+            os.makedirs(target_dir2)
         for model_name in model_names:
             found = False
             for dir_name in possible_dirs:
@@ -1208,7 +1226,7 @@ def get_pictures(imgs_names_dir = "picture/my/sr2"):
                         ori_name = fn + "." + new_ext
                         file_path = os.path.join(input_dir, model_name, dir_name, ori_name)
                         if os.path.exists(file_path):
-                            target_path = os.path.join(target_dir, new_name)
+                            target_path = os.path.join(target_dir2, new_name)
                             shutil.copy(file_path, target_path)
                             found = True
                             break  # 跳出扩展名循环
@@ -1218,6 +1236,18 @@ def get_pictures(imgs_names_dir = "picture/my/sr2"):
                     break  # 跳出目录循环
             if not found:
                 print(f"未找到文件: {file_name} 对于模型 {model_name}")
+        for gt_img_path in gt_imgs_paths:
+            gt_file = os.path.join(gt_img_path,file_name)
+            if os.path.exists(gt_file):
+                new_name = "gt." + ext
+                target_path = os.path.join(target_dir, new_name)
+                shutil.copy(gt_file, target_path)
+        for lq_imgs_path in lq_imgs_paths:
+            lq_file = os.path.join(lq_imgs_path,file_name)
+            if os.path.exists(lq_file):
+                new_name = "lq." + ext
+                target_path = os.path.join(target_dir, new_name)
+                shutil.copy(lq_file, target_path)
 
 
 def draw_rectangle(path, rectangle, out_path):
@@ -1242,8 +1272,51 @@ def draw_rectangle(path, rectangle, out_path):
 
 
 if __name__ == "__main__":
-    # get_pictures("picture/my/sr4")
 
+    # ================== 搜寻所有方法的图片 =============
+    # get_pictures("picture/origin")
+
+    # ==================裁剪 =========================
+    scale = 4
+    width = 200
+    left = 250
+    top = 650
+    dir = "picture/realset80/Canon_004_LR4-yes"
+
+    crop=True
+    crop_images2(
+        input_paths=dir+"/crop",
+        output_dir=dir+"/crop2",
+        target_size=(width ,width),
+        position=(left,top),
+        crop_mode="position",
+        allow_upscaling=False,
+        scale=4,
+        suffix="_crop"
+    )
+
+    # # 画矩形框
+    # r_left=left/scale
+    # r_top=top/scale
+    # r_width=width / scale
+    # r_height=width / scale
+    # rect = True
+    # draw_rectangle(dir+"/crop/lq_crop.png",
+    #                (r_left,r_top,r_left + r_width,r_top+r_height),
+    #                out_path=dir+"/crop2/lq_crop.png")
+
+    # with open(dir+"/crop_params.txt", 'a', encoding='utf-8') as file:
+    #     content = ""
+    #     if crop:
+    #         content = f"============== crop ==============\ndir={dir}\nscale={scale}\nwidth={width}\nleft={r_left}\ntop={r_top}\n\n"
+    #     if rect:
+    #         content+= f"============== retangle ==============\n_left={r_left:.3f}\nr_top={r_top:.3f}\nr_width={r_width:.3f}\nr_height={r_height:.3f}\n"
+    #     file.write(content)
+
+    # =============== 裁剪工具启动GUI工具===================
+
+    # app = ImageCropperGUI()
+    # app.run()
     # get_pictures()
     # ================== 训练指标折线图 ===================
     # 绘制折线图
@@ -1332,32 +1405,107 @@ if __name__ == "__main__":
     # )
 
 
-    # ==================裁剪 =========================
-    # scale = 4
-    # width = 200
-    # left = 320
-    # top = 680
-    # dir = "picture/Canon_004_LR4"
-    # crop_images2(
-    #     input_paths=dir+"/crop",
-    #     output_dir=dir+"/crop2",
-    #     target_size=(width ,width),
-    #     position=(left,top),
-    #     crop_mode="position",
-    #     allow_upscaling=False,
-    #     suffix="_crop"
-    # )
-    # #
-    # r_left=left/scale
-    # r_top=top/scale
-    # r_width=width / scale
-    # r_height=width / scale
-    # draw_rectangle(dir+"/lq_crop.png",
-    #                (r_left,r_top,r_left + r_width,r_top+r_height),
-    #                out_path=dir+"/crop2/lq.png")
+# ====================== 注意力随t变化的注意力图 =========================
+    weights = np.array([
+        # t = 3
+        [
+            [0.6867, 0.3077, 0.0051, 0.0005],  # Decoder 0
+            [0.9441, 0.0479, 0.0074, 0.0006],  # Decoder 1
+            [0.2482, 0.7044, 0.0444, 0.0029],  # Decoder 2
+            [0.0999, 0.7977, 0.0589, 0.0434],  # Decoder 3
+        ],
+        # t = 2
+        [
+            [0.6558, 0.3319, 0.0103, 0.0020],
+            [0.9380, 0.0533, 0.0078, 0.0009],
+            [0.2177, 0.6952, 0.0682, 0.0189],
+            [0.1034, 0.8229, 0.0557, 0.0179],
+        ],
+        # t = 1
+        [
+            [0.6847, 0.2941, 0.0173, 0.0039],
+            [0.9263, 0.0635, 0.0087, 0.0015],
+            [0.1841, 0.7167, 0.0779, 0.0214],
+            [0.1156, 0.8076, 0.0548, 0.0220],
+        ],
+        # t = 0
+        [
+            [0.7645, 0.2243, 0.0082, 0.0030],
+            [0.9641, 0.0234, 0.0084, 0.0042],
+            [0.2434, 0.5912, 0.1615, 0.0039],
+            [0.1542, 0.7153, 0.0825, 0.0480],
+        ],
+    ])
+    # decoder_idx = 3  # 最底层 decoder
+    # encoder_labels = ["Enc-1", "Enc-2", "Enc-3", "Enc-4"]
+    # timesteps = [3, 2, 1, 0]
+    #
+    # plt.figure(figsize=(6, 4))
+    # for enc_idx in range(4):
+    #     plt.plot(
+    #         timesteps,
+    #         weights[:, decoder_idx, enc_idx],
+    #         marker="o",
+    #         label=encoder_labels[enc_idx]
+    #     )
+    #
+    # plt.xlabel("Diffusion Step t")
+    # plt.ylabel("Attention Weight")
+    # plt.title("TDFS Temporal Evolution (Decoder 3)")
+    # plt.legend()
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.show()
+# 注意力权重分布 - 第一种
+#     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+#     # 定义新的标签
+#     decoder_labels = ['D1', 'D2', 'D3', 'D4']  # 解码器层：4（底层）到1（高层）
+#     encoder_labels = ['E1', 'E2', 'E3', 'E4']  # 编码器层：1（浅层）到4（深层）
+#     title = ["t=3","t=2","t=1","t=0"]
+#     for i, ax in enumerate(axes):
+#         sns.heatmap(
+#             weights[i],
+#             annot=True,
+#             fmt=".2f",
+#             cmap="viridis",
+#             cbar=i == 3,
+#             ax=ax,
+#             xticklabels=encoder_labels,  # 设置编码器标签
+#             yticklabels=decoder_labels,  # 设置解码器标签
+#         )
+#         # ax.set_title(f"t = {3 - i}")
+#         ax.set_title(title[i])
+#         ax.set_xlabel("Encoder")
+#         ax.set_ylabel("Decoder")
+#         ax.set_xticks(np.arange(4) + 0.5)
+#         ax.set_yticks(np.arange(4) + 0.5)
+#     plt.tight_layout()
+#     output_path = "p/tdfs_attention_heatmaps4.png"
+#     if output_path:
+#         parent = Path(output_path).parent
+#         parent.mkdir(parents=True, exist_ok=True)
+#         plt.savefig(output_path, dpi=1000, bbox_inches='tight', facecolor='white')
+#     plt.show()
 
-    # =============== 裁剪工具启动GUI工具===================
 
-    # app = ImageCropperGUI()
-    # app.run()
-
+    # 第二种 单个折线图
+    # decoder_idx = 3  # 最底层 decoder
+    # encoder_labels = ["Enc-1", "Enc-2", "Enc-3", "Enc-4"]
+    # timesteps = [3, 2, 1, 0]
+    #
+    # plt.figure(figsize=(6, 4))
+    # for enc_idx in range(4):
+    #     plt.plot(
+    #         timesteps,
+    #         weights[:, decoder_idx, enc_idx],
+    #         marker="o",
+    #         label=encoder_labels[enc_idx]
+    #     )
+    #
+    # plt.xlabel("Diffusion Step t")
+    # plt.ylabel("Attention Weight")
+    # plt.title("TDFS Temporal Evolution (Decoder 3)")
+    # plt.legend()
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.show()

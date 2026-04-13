@@ -123,7 +123,7 @@ class ResBlock(TimestepBlock):
     :param up: if True, use this block for upsampling.
     :param down: if True, use this block for downsampling.
     """
-    def __init__(
+    def  __init__(
         self,
         channels,
         emb_channels,
@@ -3080,7 +3080,7 @@ class UNetModelSwinPyConv4(nn.Module):
 
 
         self.ws=[]
-    def forward(self, x, timesteps, lq=None, mask=None):
+    def forward(self, x, timesteps, lq=None, mask=None, return_features=False):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -3113,6 +3113,7 @@ class UNetModelSwinPyConv4(nn.Module):
         h = self.middle_block(h, emb)
         output_blocks_len = len(self.output_blocks)
         self.ws =[]
+        distill_features = [] if return_features else None
         for ii,module_list in enumerate(self.output_blocks):
             curr_hs_i = output_blocks_len - ii - 1
             hs_row = hs[curr_hs_i]
@@ -3121,6 +3122,10 @@ class UNetModelSwinPyConv4(nn.Module):
             for jj,module in enumerate(module_list):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
+                if return_features:
+                    # 选择有代表性的层进行捕获，例如每个output_block的第一个跳跃连接
+                    if jj == 0:
+                        distill_features.append(res_h)
                 target_size = res_h.shape[2:]
                 afpf_features, weights= self.layer_selects[ii][jj](hs, ii,h) #  weights = [batchsize,encoder]
                 # weights = weights.mean(dim=0) #  weights = [encoder]
@@ -3152,6 +3157,9 @@ class UNetModelSwinPyConv4(nn.Module):
         #     s += row_s + "\n"
         # print(s)
         # print("="*100)
+        if return_features:
+            # 返回输出和用于蒸馏的特征列表
+            return out, distill_features
         return out
 
 
@@ -3228,7 +3236,8 @@ class UNetModelSwinPyConv5(nn.Module):
             use_amf=True,
             topk_sparse=True,
             k_norm=False,
-            k_list=None
+            k_list=None,
+            dw_conv=True,
     ):
         super().__init__()
 
@@ -3287,7 +3296,10 @@ class UNetModelSwinPyConv5(nn.Module):
         in_channels += base_chn
         self.input_blocks = nn.ModuleList([
             # in_channels=6, ch=160
-                nn.ModuleList([TimestepEmbedSequential(dw_conv_nd(dims, in_channels, ch, 3, padding=1))])
+                nn.ModuleList([TimestepEmbedSequential(dw_conv_nd(dims, in_channels, ch, 3, padding=1)
+                                                       if dw_conv else
+                                                       conv_nd(dims, in_channels, ch, 3, padding=1)
+                                                       )])
             ]
         )
 
@@ -3301,6 +3313,15 @@ class UNetModelSwinPyConv5(nn.Module):
             for jj in range(num_res_blocks[level]):
                 layers = [
                     DwResBlock(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        # out_channels=[1,2,2,4] * 160
+                        out_channels=int(mult * model_channels),
+                        dims=dims,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    ) if dw_conv else
+                    ResBlock(
                         ch,
                         time_embed_dim,
                         dropout,
@@ -3338,23 +3359,37 @@ class UNetModelSwinPyConv5(nn.Module):
             # 下采样块
             if level != len(channel_mult) - 1:
                 out_ch = ch
-                self.input_blocks[level].append(
-                    TimestepEmbedSequential(
-                        DwResBlock (
-                            ch,
-                            time_embed_dim,
-                            dropout,
-                            out_channels=out_ch,
-                            dims=dims,
-                            use_scale_shift_norm=use_scale_shift_norm,
-                            down=True,
-                        )
-                        if resblock_updown
-                        else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch,dw_conv=True
+                if resblock_updown:
+                    self.input_blocks[level].append(
+                        TimestepEmbedSequential(
+                            DwResBlock(
+                                ch,
+                                time_embed_dim,
+                                dropout,
+                                out_channels=out_ch,
+                                dims=dims,
+                                use_scale_shift_norm=use_scale_shift_norm,
+                                down=True,
+                            ) if dw_conv else
+                            ResBlock(
+                                ch,
+                                time_embed_dim,
+                                dropout,
+                                out_channels=out_ch,
+                                dims=dims,
+                                use_scale_shift_norm=use_scale_shift_norm,
+                                down=True,
+                            )
                         )
                     )
-                )
+                else:
+                    self.input_blocks[level].append(
+                        TimestepEmbedSequential(
+                            Downsample(
+                                ch, conv_resample, dims=dims, out_channels=out_ch,dw_conv=dw_conv
+                            )
+                        )
+                    )
                 ch = out_ch
                 # input_block_chans[level].append(ch)
                 ds //= 2
@@ -3367,7 +3402,15 @@ class UNetModelSwinPyConv5(nn.Module):
                 dropout,
                 dims=dims,
                 use_scale_shift_norm=use_scale_shift_norm,
-            ),
+            ) if dw_conv else
+            ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_scale_shift_norm=use_scale_shift_norm,
+            )
+            ,
             BasicLayer(
                 in_chans=ch,
                 embed_dim=swin_embed_dim,
@@ -3392,7 +3435,15 @@ class UNetModelSwinPyConv5(nn.Module):
                 dropout,
                 dims=dims,
                 use_scale_shift_norm=use_scale_shift_norm,
-            ),
+            ) if dw_conv else
+            ResBlock(
+                ch,
+                time_embed_dim,
+                dropout,
+                dims=dims,
+                use_scale_shift_norm=use_scale_shift_norm,
+            )
+            ,
         )
         self.output_blocks = nn.ModuleList([
             nn.ModuleList([]) for _ in range(len(channel_mult))
@@ -3416,7 +3467,16 @@ class UNetModelSwinPyConv5(nn.Module):
                         out_channels=int(model_channels * mult),
                         dims=dims,
                         use_scale_shift_norm=use_scale_shift_norm,
-                        )
+                        ) if dw_conv else
+                    ResBlock(
+
+                        ch + ich,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=int(model_channels * mult),
+                        dims=dims,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
                 ]
                 if self.use_amf:
                     self.skip_connections[index].append(
@@ -3448,19 +3508,32 @@ class UNetModelSwinPyConv5(nn.Module):
 
                 if level and i == num_res_blocks[level]:
                     out_ch = ch
-                    layers.append(
-                        DwResBlock(
-                            ch,
-                            time_embed_dim,
-                            dropout,
-                            out_channels=out_ch,
-                            dims=dims,
-                            use_scale_shift_norm=use_scale_shift_norm,
-                            up=True,
+                    if resblock_updown:
+                        layers.append(
+                            DwResBlock(
+                                ch,
+                                time_embed_dim,
+                                dropout,
+                                out_channels=out_ch,
+                                dims=dims,
+                                use_scale_shift_norm=use_scale_shift_norm,
+                                up=True,
+                            ) if dw_conv else
+                            ResBlock(
+                                ch,
+                                time_embed_dim,
+                                dropout,
+                                out_channels=out_ch,
+                                dims=dims,
+                                use_scale_shift_norm=use_scale_shift_norm,
+                                up=True,
+                            )
+
                         )
-                        if resblock_updown
-                        else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch,dw_conv=True)
-                    )
+                    else:
+                        layers.append(
+                            Upsample(ch, conv_resample, dims=dims, out_channels=out_ch,dw_conv=dw_conv)
+                        )
                     ds *= 2
 
 
@@ -3469,37 +3542,21 @@ class UNetModelSwinPyConv5(nn.Module):
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
-            dw_conv_nd(dims, input_ch, out_channels, 3, padding=1),
+            dw_conv_nd(dims, input_ch, out_channels, 3, padding=1) if dw_conv else conv_nd(dims, input_ch, out_channels, 3, padding=1),
         )
         if self.use_amf:
             for level, mult in list(enumerate(channel_mult))[::-1]:
-                # index = len(channel_mult) - level - 1
-                # layer_length = len(channel_mult)
+                self.afpfs.append(nn.ModuleList([]))
+                self.layer_selects.append(nn.ModuleList())
+                index = len(channel_mult) - level - 1
                 ch = int(model_channels * mult)
                 if f'{ch}' not in self.aligns:
                     self.aligns[f'{ch}'] = FeatureAlign2(layer_chs, ch)
-                # self.aligns.append(nn.ModuleList([]))
-                # for i in range(num_res_blocks[level] + 1):
-                #     ich = input_block_chans2[level].pop()  # 编码器层的输出通道数
-                #     self.aligns[index].append(
-                #         FeatureAlign2(layer_chs, ich)
-                #     )
-            for level, mult in list(enumerate(channel_mult))[::-1]:
-                self.afpfs.append(nn.ModuleList([]))
-                index = len(channel_mult) - level - 1
                 for i in range(num_res_blocks[level] + 1):
                     ich = input_block_chans3[level].pop()  # 编码器层的输出通道数
                     self.afpfs[index].append(
                             SCAttentionAFPF3(layer_chs, ich,time_emb_dim=time_embed_dim)
                     )
-            for level, mult in list(enumerate(channel_mult))[::-1]:
-
-                index = len(channel_mult) - level - 1
-
-                self.layer_selects.append(nn.ModuleList())
-                ch = int(model_channels * mult)
-                for i in range(num_res_blocks[level] + 1):
-                    ich = input_block_chans4[level].pop()  # 编码器层的输出通道数
                     if i == 0:
                         self.layer_selects[index].append(
                             AdaptiveFeatureSelect4(layer_chs,
@@ -3526,8 +3583,9 @@ class UNetModelSwinPyConv5(nn.Module):
                         )
 
 
+
         self.ws=[]
-    def forward(self, x, timesteps, lq=None, mask=None):
+    def forward(self, x, timesteps, lq=None, mask=None, return_features=False):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -3560,6 +3618,7 @@ class UNetModelSwinPyConv5(nn.Module):
         h = self.middle_block(h, emb)
         output_blocks_len = len(self.output_blocks)
         self.ws =[]
+        distill_features = [] if return_features else None
         for ii,module_list in enumerate(self.output_blocks):
             curr_hs_i = output_blocks_len - ii - 1
             hs_row = hs[curr_hs_i]
@@ -3567,6 +3626,10 @@ class UNetModelSwinPyConv5(nn.Module):
             for jj,module in enumerate(module_list):
                 curr_hs_j = len(hs_row) - jj - 1
                 res_h = hs_row[curr_hs_j]
+                if return_features:
+                    # 选择有代表性的层进行捕获，例如每个output_block的第一个跳跃连接
+                    if jj == 0:
+                        distill_features.append(res_h)
                 if self.use_amf:
                     target_size = res_h.shape[2:]
                     target_ch = res_h.shape[1]
@@ -3581,7 +3644,7 @@ class UNetModelSwinPyConv5(nn.Module):
                     # for afpf_aligned_feature in afpf_aligned_features:
                     #     multi_h+=afpf_aligned_feature
                     # multi_h += res_h
-                    multi_h = self.skip_connections[ii][jj](multi_h)
+                    #  multi_h = self.skip_connections[ii][jj](multi_h)
                     # 1、skip跳越层
                     skip_h = self.skip_connections[ii][jj](res_h)
                     res_h = skip_h + multi_h
@@ -3589,9 +3652,34 @@ class UNetModelSwinPyConv5(nn.Module):
                 h = module(h, emb)
         h = h.type(x.dtype)
         out = self.out(h)
+
+        # print("="*50+f" t={timesteps.item()} "+"="*50)
+        # self.log_prior_att(r=3,c=0)
+        if return_features:
+            # 返回输出和用于蒸馏的特征列表
+            return out, distill_features
         return out
 
+    def log_prior_att(self,r=None,c=None):
+        #  ws = [row,num_resblocks,bs,encoder_layers] = [4,3,4,4]
+        ws = self.ws
+        if ws and len(ws) > 0:
+            s = ""
+            for i, row in enumerate(ws):  # row = [num_resblocks,bs,encoders]
+                if r is not None and r != i:
+                    continue
+                row_s = ""
 
+                for j, col in enumerate(row):  # col= [bs,encoders]
+                    if c is not None and j != c:
+                        continue
+                    if len(col.shape) != 1:
+                        col = col.mean(dim=0)
+                    arr1 = [round(x, 4) for x in col.tolist()]
+                    # arr1 = [round(x, 4) for x in col.softmax(dim=0).tolist()]
+                    row_s += f'Decoder({i},{j})={arr1}  '
+                s += row_s + "\n"
+            print(s)
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.

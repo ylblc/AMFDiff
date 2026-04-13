@@ -563,10 +563,7 @@ class GaussianDiffusion:
         terms = {}
 
         if self.loss_type == LossType.MSE or self.loss_type == LossType.WEIGHTED_MSE:
-            model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
-            if tmodel is not None:
-                with torch.no_grad():
-                    t_model_output = tmodel(self._scale_input(z_t, t), t, **model_kwargs)
+            model_output, student_features= model(self._scale_input(z_t, t), t,return_features=True, **model_kwargs)
             target = {
                 ModelMeanType.START_X: z_start,
                 ModelMeanType.RESIDUAL: z_y - z_start,
@@ -583,8 +580,20 @@ class GaussianDiffusion:
                 weights = 1
             terms["mse"] *= weights
             if tmodel is not None:
+                with torch.no_grad():
+                    t_model_output , teacher_features = tmodel(self._scale_input(z_t, t), t,return_features=True, **model_kwargs)
+                z_start = t_model_output.detach()
+                t_target = {
+                    ModelMeanType.START_X: z_start,
+                    ModelMeanType.RESIDUAL: z_y - z_start,
+                    ModelMeanType.EPSILON: noise,
+                    ModelMeanType.EPSILON_SCALE: noise * self.kappa * _extract_into_tensor(self.sqrt_etas, t,
+                                                                                           noise.shape),
+                }[self.model_mean_type]
                 # teacher loss
-                terms["distill_mse"] =  mean_flat((t_model_output.detach() - model_output)**2)
+                distill_type = "l2"
+                terms["distill_mse"] =  mean_flat((t_target - model_output)**2) if distill_type == "l2" else (t_target - model_output).abs()
+                terms["distill_features"] = self.distill_features_loss(student_features,teacher_features,loss_type="l2")
             else:
                 terms["distill_mse"] = torch.zeros_like(terms["mse"])
         else:
@@ -603,6 +612,38 @@ class GaussianDiffusion:
 
         return terms, z_t, pred_zstart,z_start
 
+    def distill_features_loss(self, student_features, teacher_features,loss_type = "mse"):
+        """
+        计算特征蒸馏损失。
+        参数:
+            student_features: 学生模型的特征列表，每个元素为 [B, C, H, W]
+            teacher_features: 教师模型的特征列表，与student_features一一对应
+        返回:
+            平均特征损失
+        """
+        total_loss = 0.0
+        num_layers = 0
+
+        for s_feat, t_feat in zip(student_features, teacher_features):
+            # 确保特征图尺寸一致（通过插值）
+            if s_feat.shape[-2:] != t_feat.shape[-2:]:
+                s_feat = F.interpolate(s_feat, size=t_feat.shape[-2:], mode='bilinear', align_corners=False)
+
+            # 计算单层损失
+            if loss_type == 'l2':
+                layer_loss = mean_flat((s_feat- t_feat.detach()) ** 2)
+            elif loss_type == 'l1':
+                layer_loss = (s_feat - t_feat.detach()).abs()
+            else:
+                raise ValueError(f"不支持的损失类型: {loss_type}")
+
+            total_loss += layer_loss
+            num_layers += 1
+
+        if num_layers > 0:
+            return total_loss / num_layers
+        else:
+            return torch.tensor(0.0)
     def _scale_input(self, inputs, t):
         if self.normalize_input:
             if self.latent_flag:

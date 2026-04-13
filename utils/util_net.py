@@ -95,4 +95,5 @@ def reload_model(model, ckpt):
             target_key = 'module.' + target_key
 
         assert target_key in ckpt, f'{target_key} not in ckpt'
+        assert source_value.size() == ckpt[target_key].size(), f"size of {source_key} != {ckpt[target_key].size()}"
         source_value.copy_(ckpt[target_key])

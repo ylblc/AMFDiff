@@ -9,7 +9,7 @@ import shutil
 from copy import deepcopy
 from pathlib import Path
 from time import sleep
-
+import lpips
 import lpips
 import pyiqa
 from PIL import Image
@@ -247,7 +247,7 @@ def flops(model,input=None):
     print(f"Total FLOPs: ", total)
     print(f"Total FLOPs (G): {total / 1e9:.4} G")  # 转换为十亿次单位(G)
     # 分析parameters
-    print(parameter_count_table(model))
+    # print(parameter_count_table(model))
     return total
 
 
@@ -345,7 +345,7 @@ def rename(directory,key):
 
     print(f"\n完成！共重命名了 {renamed_count} 个文件。")
 
-def get_model(config,rank=0):
+def get_model(configs,rank=0):
     params = configs.model.get('params', dict)
     model = util_common.get_obj_from_str(configs.model.target)(**params)
     model.cuda()
@@ -360,12 +360,13 @@ def get_model(config,rank=0):
     return model
 
 def batch_metrix(gt_dir,sr_dir,device ="cuda",border=0,ycbcr=True,only_musiq_iqa=False):
-    device = device if not only_musiq_iqa else "cpu"
+    device = device
     ssim_total = []
     lpips_total = []
     psnr_total = []
     musiq_total = []
     clip_iqa_total = []
+    map = {}
     files=os.listdir(sr_dir)
     file_len=len(files)
     lpips_metric_vgg = lpips.LPIPS(net='vgg').to(device)
@@ -381,16 +382,37 @@ def batch_metrix(gt_dir,sr_dir,device ="cuda",border=0,ycbcr=True,only_musiq_iqa
                 print(f'Error:{f_name} not in gt_dir,please make sure lq_img_name == gt_img_name')
             gt_tensor = util_image.img2tensor(gt).to(device) # [0,1]
         sr_path = os.path.join(sr_dir, f_name)
+        fn,ext = os.path.splitext(f_name)
+        if ext not in ['.jpg','.png','.jpeg']:
+            continue
         sr=util_image.imread(sr_path)
         sr_tensor = util_image.img2tensor(sr).to(device)
         if not only_musiq_iqa:
-            psnr_total.append(util_image.calculate_psnr(gt *255,sr *255,border=border,ycbcr=ycbcr))
-            ssim_total.append(util_image.calculate_ssim(gt *255,sr *255,border=border,ycbcr=ycbcr))
+            psnr = util_image.calculate_psnr(gt *255,sr *255,border=border,ycbcr=ycbcr)
+            psnr_total.append(psnr)
+            ssim = util_image.calculate_ssim(gt *255,sr *255,border=border,ycbcr=ycbcr)
+            ssim_total.append(ssim)
         with torch.no_grad():
             if not only_musiq_iqa:
-                lpips_total.append(lpips_metric_vgg(gt_tensor *2-1, sr_tensor *2-1).view(-1).item())
-            musiq_total.append(musiq_metric(sr_path))
-            clip_iqa_total.append(clip_iqa_metric(sr_path))
+                LPIPS = lpips_metric_vgg(gt_tensor *2-1, sr_tensor *2-1).view(-1).item()
+                lpips_total.append(LPIPS)
+            musiq = musiq_metric(sr_path)
+            musiq_total.append(musiq)
+            clip = clip_iqa_metric(sr_path)
+            clip_iqa_total.append(clip)
+        if not only_musiq_iqa:
+            map[f_name] = {
+                "psnr": psnr,
+                "ssim": ssim,
+                "lpips": lpips,
+                "musiq": musiq_metric(sr_path),
+                "clip": clip
+            }
+        else:
+            map[f_name] = {
+                "musiq": musiq_metric(sr_path),
+                "clip": clip
+            }
         print(f"{i+1}/{file_len}: {f_name}")
         total+=1
     print(f"总计成功处理 {total} 个文件...")
@@ -484,7 +506,7 @@ if __name__ == '__main__':
     in_path_dir= "testdata/Val_SR"
     (configs, chop_stride) = get_configs(args)
     configs.model.target = 'models.unet.UNetModelSwinPyConv5'
-    configs.model.ckpt_path = 'weights/lite_model_75000.pth'
+    configs.model.ckpt_path = 'weights/2layer-stu-16000-multi_step.pth'
     # weights/exp/no-no-mfr11-60000.pth
     # 'weights/dfs2-aff-pc-60000.pth'
     # weights/01-aff-mfr_60000.pth
@@ -492,34 +514,38 @@ if __name__ == '__main__':
     # weights/resshift_realsrx4_s4_v3.pth
     # weights/exp/mybase-4-90000.pth
     # 1、计算flops
-    model = get_model(configs)
+    # model = get_model(configs)
     # flops(model)
 
     # 2、适合于消融测试
-    metrix_model_baseline_model(configs, in_path_dir+"/lq",
-                                in_path_dir+"/gt",
-                                chop_stride=chop_stride,
-                                output_dir="test_set5" ,
-                                save_img=False,
-                                )
+    # metrix_model_baseline_model(configs, in_path_dir+"/lq",
+    #                             in_path_dir+"/gt",
+    #                             chop_stride=chop_stride,
+    #                             output_dir="test_set5" ,
+    #                             save_img=False,
+    #                             )
 
 
     # 3、对比实验测试指标：跨sr目录测试指标psnr、lpips、ssim...
     # rename("../DASR-master/results/DASR2/visualization/RealSet80","_DASR2")
-    # sr_imgs_dir = "result/realsr-jpeg/realset80"
-    # key="realsrjpeg-realset80"
-    # gt_dir = "testdata/RealSRx4/gt"
+    sr_imgs_dir = "../SinSR-main/outputs/2layer-stu-24000-one_step-stage2/realsr"
+    key="2layer-stu-24000-one_step-stage2-realsr"
+    gt_dir = "testdata/RealSRx4/gt"
     #
-    # s = f"gt_dir: {gt_dir}\n"
-    # psnr, lpips, ssim, m, c = batch_metrix(gt_dir, sr_imgs_dir,only_musiq_iqa= True)
-    # s+=f"{key}[{sr_imgs_dir}] —— PSNR: {psnr:.4f},LPIPS: {lpips:.4f},SSIM: {ssim:.4f},Musiq: {m.item():.4f},ClipIQA: {c.item():.4f}\n"
-    # s+="="*50
-    # print(s)
-    # shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
-    # start_time = datetime.datetime.now(shanghai_tz)
-    # logger.remove(0)
-    # logger.add(f"m/{start_time.strftime('%Y-%m-%d-%H-%M-%S')}_{key}.log")
-    # logger.info(s)
+    s = f"gt_dir: {gt_dir}\n"
+    psnr, lpips, ssim, m, c = batch_metrix(gt_dir, sr_imgs_dir)
+    s+=f"{key}[{sr_imgs_dir}] —— PSNR: {psnr:.4f},LPIPS: {lpips:.4f},SSIM: {ssim:.4f},Musiq: {m.item():.4f},ClipIQA: {c.item():.4f}\n"
+    s+="="*50
+    print(s)
+    shanghai_tz = datetime.timezone(datetime.timedelta(hours=+8))
+    start_time = datetime.datetime.now(shanghai_tz)
+    logger.remove(0)
+    logger.add(f"m/{start_time.strftime('%Y-%m-%d-%H-%M-%S')}_{key}.log")
+    logger.info(s)
+
+
+
+
 
     # 4、生成线性插值图片
     # bicubic("testdata/RealSet80","result/bicubic/realset80",scale_factor=4)

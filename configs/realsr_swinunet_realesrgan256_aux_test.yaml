@@ -1,6 +1,6 @@
 trainer:
-  target: trainer.TrainerDifIRLPIPS
-
+  target: trainer.TrainerDifIRLPIPSVGG
+resume: ~
 autoencoder:
   target: ldm.models.autoencoder.VQModelTorch
   ckpt_path: weights/autoencoder_vq_f4.pth
@@ -26,40 +26,11 @@ autoencoder:
       dropout: 0.0
       padding_mode: zeros
 
-#tmodel:
-#  target: models.unet.UNetModelSwinPyConv5
-#  #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
-#  ckpt_path: weights/2layer-teacher.pth
-#  params:
-#    image_size: 64
-#    in_channels: 3
-#    model_channels: 160
-#    out_channels: ${autoencoder.params.embed_dim}
-#    attention_resolutions: [64,32,16,8]
-#    dropout: 0
-#    channel_mult: [1, 2]
-#    num_res_blocks: [2, 2]
-#    conv_resample: True
-#    dims: 2
-#    use_fp16: False
-#    num_head_channels: 32
-#    use_scale_shift_norm: True
-#    resblock_updown: False
-#    swin_depth: 2
-#    swin_embed_dim: 192
-#    window_size: 8
-#    mlp_ratio: 4
-#    cond_lq: True
-#    lq_size: 64
-#    use_amf: True
-#    topk_sparse: False
-#    k_norm: False
-#    k_list: [2]
-#    dw_conv: False
 model:
-  target: models.unet.UNetModelSwinPyConv5
+  target: models.unet.UNetModelSwin
   #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
-  ckpt_path: ~
+#  ckpt_path: weights/resshift_realsrx4_s4_v3.pth
+  ckpt_path: weights/resshift_realsrx4_s4_v3.pth
   params:
     image_size: 64
     in_channels: 3
@@ -67,8 +38,8 @@ model:
     out_channels: ${autoencoder.params.embed_dim}
     attention_resolutions: [64,32,16,8]
     dropout: 0
-    channel_mult: [1, 2 ]
-    num_res_blocks: [2, 2 ]
+    channel_mult: [1, 2, 2, 4]
+    num_res_blocks: [2, 2, 2, 2]
     conv_resample: True
     dims: 2
     use_fp16: False
@@ -81,11 +52,43 @@ model:
     mlp_ratio: 4
     cond_lq: True
     lq_size: 64
-    use_amf: True
-    topk_sparse: False
-    k_norm: False
-    k_list: [2]
-    dw_conv: True
+
+aux_model:
+  target: models.unet.AuxUNetModelPyConv2
+  #ckpt_path: /mnt/lustre/zsyue/projects/ResShift/SR/models/swin_v2/Esr256_ImageNet_rescale/S5_K2.0_P0.3/ema_ckpts/ema_model_300000.pth
+  ckpt_path: weights/aux_model_diff_10000.pth
+  train:
+    lr: 5e-5                      # learning rate  5e-6 ≤ lr ≤ 2e-5
+    lr_min: 2e-5                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
+    lr_schedule: cosin
+    #  lr_schedule: cosinRestarts
+    warmup_iterations: 5000           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
+    cycle_iterations: 3500           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
+    t_mult: 2
+    weight_decay: 1e-4
+  residual_factor: 1
+  params:
+    image_size: 64
+    in_channels: 3
+    model_channels: 160
+    out_channels: ${autoencoder.params.embed_dim}
+    attention_resolutions: [ 64,32 ]
+    dropout: 0
+    channel_mult: [ 1,2,2,4 ]
+    num_res_blocks: [ 2,2,2,2 ]
+    conv_resample: True
+    dims: 2
+    use_fp16: False
+    num_head_channels: 32
+    use_scale_shift_norm: True
+    resblock_updown: False
+    swin_depth: 2
+    swin_embed_dim: 192
+    window_size: 8
+    mlp_ratio: 4
+    cond_lq: True
+    lq_size: 64
+
 diffusion:
   target: models.script_util.create_gaussian_diffusion
   params:
@@ -129,7 +132,7 @@ degradation:
   gray_noise_prob2: 0.4
   jpeg_range2: [30, 95]
 
-  gt_size: 256 
+  gt_size: 256
   resize_back: False
   use_sharp: False
 
@@ -137,11 +140,14 @@ data:
   train:
     type: realesrgan
     params:
-      dir_paths: ['traindata/DIV2K_train_HR',"traindata/Flickr2K"]
+      dir_paths: [
+                  'traindata/DIV2K_train_HR',
+                  "traindata/Flickr2K"
+      ]
       txt_file_path: [
 #                      '/mnt/sfs-common/zsyue/database/ImageNet/files_txt/path_train_all.txt',
 #                      '/mnt/sfs-common/zsyue/database/FFHQ/files_txt/files256.txt',
-                     ] 
+                     ]
       im_exts: ['jpeg','png','jpg']
       io_backend:
         type: disk
@@ -188,10 +194,10 @@ train:
   # learning rate
   lr: 5e-5                      # learning rate  5e-6 ≤ lr ≤ 2e-5
   lr_min: 2e-5                      # learning rate 1e-7 ≤ lr_min ≤ 5e-6
-  lr_schedule: cosin                # cosin or cosinRestarts
+  lr_schedule: cosin
 #  lr_schedule: cosinRestarts
   warmup_iterations: 5000           # 应占总迭代数的 5%-15%，即对于10k总迭代：500 ≤ warmup ≤ 1500
-  cycle_iterations: 3000           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
+  cycle_iterations: 4500           # 总迭代10k时，建议 2-3个完整周期 → 3300 ≤ cycle ≤ 5000，cycle ≥ 2×warmup
   t_mult: 2
   # dataloader
 #  [训练批次大小, 验证批次大小]
@@ -199,15 +205,15 @@ train:
 #  总批次大小 = 微批次大小 * GPU数量 * 梯度累积次数
   microbatch: 4
   num_workers: 8
-  prefetch_factor: 2            
+  prefetch_factor: 2
   # optimization settings
-  weight_decay: 1e-4               
+  weight_decay: 1e-4
   ema_rate: 0.999
-  iterations: 10            # total iterations
+  iterations: 20            # total iterations
   # save logging
   save_freq: 2
   log_freq: [2,2,4]         # [training loss, training images, val images]
-  loss_coef: [1.0, 0, 1.0, 0.1]         # [mse, lpips, distill_out, distill_features] 当mse<0,计算像素mse
+  loss_coef: [1.0, 1.0]         # [mse, lpips]
   local_logging: True           # manually save images
   tf_logging: False             # tensorboard logging
   # validation settings

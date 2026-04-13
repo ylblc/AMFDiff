@@ -197,7 +197,7 @@ class PyConv3AdaptiveSEResDP(nn.Module):
         self.max_depth = max_depth
         self.drop_prob = drop_prob
         self.drop_path = DropPath(self.drop_prob) if self.drop_prob > 0 else nn.Identity()
-        self.alpha = nn.Parameter(torch.tensor([0.5]))
+        self.alpha = nn.Parameter(torch.tensor(0.5))
         self.eps = 1e-6  # 数值安全阈值
     def forward(self, x):
         identity = x
