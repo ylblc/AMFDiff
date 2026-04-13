@@ -146,12 +146,11 @@ def predict(in_path, task='realsrx4', seed=12345, scale=4, version='v3'):
 
 title = "AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution"
 description = r"""
-<b>Official Gradio demo</b> for <a href='https://github.com/zsyOAOA/ResShift' target='_blank'><b>AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution</b></a>.<br>
+<b>Project</b> for <a href='https://github.com/zsyOAOA/ResShift' target='_blank'><b>AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution</b></a>.<br>
 🔥 AMFDiff: Adaptive Multi-scale Fusion Diffusion Model for Image Super-Resolution.<br>
 """
 article = r"""
 If AMFDiff is helpful for your work, please help to ⭐ the <a href='https://github.com/ylblc/AMFDiff' target='_blank'>Github Repo</a>. Thanks!
-
 """
 demo = gr.Interface(
     fn=predict,
